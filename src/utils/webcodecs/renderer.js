@@ -9,7 +9,7 @@
 
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer'
 import { demux } from './demuxer.js'
-import { applyEdgeFades, concatWithSplice, findZeroCrossing } from '../audioSplice.js'
+import { concatWithSplice, findZeroCrossing } from '../audioSplice.js'
 
 const FPS = 30
 const FRAME_US = 1_000_000 / FPS
@@ -76,22 +76,47 @@ async function buildAudioTrack(clips, plan, placements, totalSec, transitionSec,
   }
 
   const segs = plan.segments
+  const hasTransition = segs.some((s, i) => i > 0 && s.transition !== 'cut')
+  const rendered = [] // per-segment AudioBuffers, in order (only used when !hasTransition)
+
   for (let i = 0; i < segs.length; i++) {
     const seg = segs[i]
     const clip = clips.find((c) => c.id === seg.clipId) || clips.find((c) => c.name === seg.clip)
     if (!clip) continue
     const src = await getAudio(clip)
-    const segDur = Math.max(0.01, seg.end - seg.start)
+
+    onProgress({ stage: 'audio', pct: Math.round((i / segs.length) * 100), msg: `Mixing audio ${i + 1}/${segs.length}…` })
+
+    // Snap the slice in/out points to the nearest zero crossing in the source —
+    // this alone kills most of the splice click, before any fade.
+    let sliceStart = Math.max(0, seg.start)
+    let sliceEnd = Math.max(sliceStart + 0.01, seg.end)
+    if (src) {
+      const sr = src.sampleRate
+      const ch0 = src.getChannelData(0)
+      const radius = Math.round(0.01 * sr)
+      sliceStart = findZeroCrossing(ch0, seg.start * sr, radius) / sr
+      sliceEnd = findZeroCrossing(ch0, seg.end * sr, radius) / sr
+      if (sliceEnd - sliceStart < 0.01) {
+        sliceStart = Math.max(0, seg.start)
+        sliceEnd = seg.end
+      }
+    }
+    const segDur = Math.max(0.01, sliceEnd - sliceStart)
+
+    // Transitions overlap the neighbour → equal-power crossfade ramp (a
+    // different case from a butt-joined splice, which gets edge fades below).
     const fadeIn = i > 0 && seg.transition !== 'cut' ? Math.min(transitionSec, segDur / 2) : 0
     const fadeOut =
       i < segs.length - 1 && segs[i + 1].transition !== 'cut' ? Math.min(transitionSec, segDur / 2) : 0
 
-    onProgress({ stage: 'audio', pct: Math.round((i / segs.length) * 100), msg: `Mixing audio ${i + 1}/${segs.length}…` })
-
-    if (!src) continue
+    if (!src) {
+      if (!hasTransition) rendered.push(new AudioBuffer({ length: Math.round(segDur * RATE), numberOfChannels: 2, sampleRate: RATE }))
+      continue
+    }
 
     const frames = Math.round(segDur * RATE)
-    const oac = new OfflineAudioContext(2, frames, RATE)
+    const oac = new OfflineAudioContext(2, Math.max(1, frames), RATE)
     const node = oac.createBufferSource()
     node.buffer = src
     const gain = oac.createGain()
@@ -102,15 +127,42 @@ async function buildAudioTrack(clips, plan, placements, totalSec, transitionSec,
     if (fadeIn > 0) gain.gain.setValueCurveAtTime(equalPowerCurve('in'), 0, fadeIn)
     if (fadeOut > 0) gain.gain.setValueCurveAtTime(equalPowerCurve('out'), Math.max(0, segDur - fadeOut), fadeOut)
 
-    node.start(0, Math.max(0, seg.start), segDur)
-    const rendered = await oac.startRendering()
+    node.start(0, sliceStart, segDur)
+    const buf = await oac.startRendering()
 
-    const cl = rendered.getChannelData(0)
-    const cr = rendered.numberOfChannels > 1 ? rendered.getChannelData(1) : cl
+    if (!hasTransition) {
+      // Pure cut sequence — collect and butt-join with splice hygiene below.
+      rendered.push(buf)
+      continue
+    }
+
+    // Mixed sequence: place + sum for the overlaps, but micro-fade this piece's
+    // edges first so any butt-joined (cut) edge doesn't click.
+    const cl = buf.getChannelData(0)
+    const cr = buf.numberOfChannels > 1 ? buf.getChannelData(1) : cl
+    if (!fadeIn) {
+      spliceFadeHead(cl, RATE)
+      if (cr !== cl) spliceFadeHead(cr, RATE)
+    }
+    if (!fadeOut) {
+      spliceFadeTail(cl, RATE)
+      if (cr !== cl) spliceFadeTail(cr, RATE)
+    }
     const offFrame = Math.round(placements[i] * RATE)
     for (let f = 0; f < cl.length && offFrame + f < totalFrames; f++) {
       L[offFrame + f] += cl[f]
       R[offFrame + f] += cr[f]
+    }
+  }
+
+  if (!hasTransition) {
+    // One clean butt-join of every piece, each edge equal-power faded.
+    const master = concatWithSplice(rendered, RATE, 2)
+    return {
+      L: master.getChannelData(0),
+      R: master.numberOfChannels > 1 ? master.getChannelData(1) : master.getChannelData(0),
+      sampleRate: RATE,
+      totalFrames: master.length,
     }
   }
 
@@ -123,6 +175,23 @@ async function buildAudioTrack(clips, plan, placements, totalSec, transitionSec,
   }
 
   return { L, R, sampleRate: RATE, totalFrames }
+}
+
+// One-sided equal-power edge fades for the mixed (place+sum) path — a transition
+// edge is already covered by the crossfade, so only the butt-joined edge needs
+// smoothing. (concatWithSplice fades both edges for the pure-cut path.)
+function spliceFadeHead(data, rate, ms = 15) {
+  let ramp = Math.floor((ms / 1000) * rate)
+  if (ramp < 1) ramp = 1
+  if (data.length < ramp * 2) ramp = Math.floor(data.length / 2)
+  for (let i = 0; i < ramp; i++) data[i] *= Math.sin((i / ramp) * (Math.PI / 2))
+}
+function spliceFadeTail(data, rate, ms = 15) {
+  const len = data.length
+  let ramp = Math.floor((ms / 1000) * rate)
+  if (ramp < 1) ramp = 1
+  if (len < ramp * 2) ramp = Math.floor(len / 2)
+  for (let i = 0; i < ramp; i++) data[len - ramp + i] *= Math.cos(((i + 1) / ramp) * (Math.PI / 2))
 }
 
 async function encodeAudio(track, muxer, onProgress) {

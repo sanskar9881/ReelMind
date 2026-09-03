@@ -1054,6 +1054,14 @@ export default function Editor() {
               {result && (
                 <div className="ed-result">
                   <div className="ed-ok">Render complete · {fmtSize(result.size)}</div>
+                  {typeof result.shots === 'number' && (
+                    <div className="ed-dim">
+                      Rendered {result.shots} shot{result.shots === 1 ? '' : 's'}
+                      {result.internalCuts > 0
+                        ? `, ${result.internalCuts} internal cut${result.internalCuts === 1 ? '' : 's'}`
+                        : ', no internal cuts'}
+                    </div>
+                  )}
                   <div className="ed-dim">
                     {result.method === 'webcodecs'
                       ? 'Rendered on GPU (WebCodecs).'
