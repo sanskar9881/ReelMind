@@ -9,6 +9,7 @@
 
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer'
 import { demux } from './demuxer.js'
+import { applyEdgeFades, concatWithSplice, findZeroCrossing } from '../audioSplice.js'
 
 const FPS = 30
 const FRAME_US = 1_000_000 / FPS

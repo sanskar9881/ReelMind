@@ -361,11 +361,13 @@ export async function render(clips, plan, opts = {}, onProgress = () => {}) {
     ? { supported: false, reason: 'Forced software render.' }
     : await checkWebCodecsSupport()
 
+  const stats = countCuts(plan)
+
   if (support.supported) {
     try {
       onProgress({ stage: 'webcodecs', pct: 0, msg: 'Starting GPU render…' })
       const out = await renderWithWebCodecs(clips, applyCutRanges(plan), opts, onProgress)
-      return { ...out, method: 'webcodecs', fellBack: false }
+      return { ...out, ...stats, method: 'webcodecs', fellBack: false }
     } catch (err) {
       // WebCodecs failed — log and retry the entire render on FFmpeg.
       console.error('[render] WebCodecs path failed; falling back to FFmpeg:', err)
@@ -375,12 +377,12 @@ export async function render(clips, plan, opts = {}, onProgress = () => {}) {
         msg: `GPU render failed (${err?.message || err}). Retrying with FFmpeg…`,
       })
       const out = await renderVideo(clips, plan, opts, onProgress)
-      return { ...out, method: 'ffmpeg', fellBack: true, fallbackReason: err?.message || String(err) }
+      return { ...out, ...stats, method: 'ffmpeg', fellBack: true, fallbackReason: err?.message || String(err) }
     }
   }
 
   const out = await renderVideo(clips, plan, opts, onProgress)
-  return { ...out, method: 'ffmpeg', fellBack: false, reason: support.reason }
+  return { ...out, ...stats, method: 'ffmpeg', fellBack: false, reason: support.reason }
 }
 
 /**
