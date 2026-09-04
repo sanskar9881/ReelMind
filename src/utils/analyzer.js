@@ -111,7 +111,7 @@ function seek(v, t) {
 }
 
 async function analyzeMotion(url, duration, width, height) {
-  const empty = { windows: [], avg: 0, busiestAt: 0 }
+  const empty = { windows: [], avg: 0, busiestAt: 0, lumaAvg: 0.5, contrastAvg: 0.5 }
   let v
   try {
     v = await loadVideo(url)
@@ -136,6 +136,20 @@ async function analyzeMotion(url, duration, width, height) {
       await seek(v, t)
       ctx.drawImage(v, 0, 0, w, h)
       const frame = ctx.getImageData(0, 0, w, h).data
+      // Exposure + contrast, from the same downscaled read the diff already
+      // needs — the planner scores a candidate's picture quality with these,
+      // and a second decode pass just for them would be unaffordable.
+      let lumaSum = 0
+      let lumaSqSum = 0
+      const px = frame.length / 4
+      for (let i = 0; i < frame.length; i += 4) {
+        const y = (0.2126 * frame[i] + 0.7152 * frame[i + 1] + 0.0722 * frame[i + 2]) / 255
+        lumaSum += y
+        lumaSqSum += y * y
+      }
+      const luma = lumaSum / px
+      // Population SD of luma — a flat/hazy shot sits near 0, a punchy one high.
+      const contrast = Math.sqrt(Math.max(0, lumaSqSum / px - luma * luma))
       if (prev) {
         let diff = 0
         for (let i = 0; i < frame.length; i += 4) {
@@ -143,7 +157,7 @@ async function analyzeMotion(url, duration, width, height) {
         }
         // Mean per-pixel channel delta, 0..1.
         const score = clamp01(diff / ((frame.length / 4) * 3 * 255))
-        windows.push({ t, score })
+        windows.push({ t, score, luma, contrast })
         if (score > busiest.v) busiest = { t, v: score }
       }
       prev = frame
@@ -155,8 +169,11 @@ async function analyzeMotion(url, duration, width, height) {
     v.load()
   }
 
-  const avg = clamp01(windows.reduce((a, x) => a + x.score, 0) / (windows.length || 1))
-  return { windows, avg, busiestAt: busiest.t }
+  const n = windows.length || 1
+  const avg = clamp01(windows.reduce((a, x) => a + x.score, 0) / n)
+  const lumaAvg = windows.reduce((a, x) => a + (x.luma || 0), 0) / n
+  const contrastAvg = windows.reduce((a, x) => a + (x.contrast || 0), 0) / n
+  return { windows, avg, busiestAt: busiest.t, lumaAvg, contrastAvg }
 }
 
 // ---- highlights --------------------------------------------------------
@@ -234,6 +251,10 @@ export async function analyzeClip(clip, onProgress = () => {}) {
     // convenience scalars for UI / planner
     energy: audio.energy,
     motionAvg: motion.avg,
+    lumaAvg: motion.lumaAvg,
+    contrastAvg: motion.contrastAvg,
+    // 'dark' | 'bright' | 'ok' — the planner penalises the first two.
+    exposure: motion.lumaAvg < 0.18 ? 'dark' : motion.lumaAvg > 0.82 ? 'bright' : 'ok',
     silenceRatio: clamp01(
       audio.silences.reduce((a, s) => a + (s.end - s.start), 0) / (clip.duration || 1),
     ),

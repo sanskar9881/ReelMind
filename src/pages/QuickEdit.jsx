@@ -5,7 +5,7 @@ import { analyzeAll } from '../utils/analyzer.js'
 import { generateEditPlan, USE_MOCK } from '../utils/ai.js'
 import { render, estimateRenderSeconds } from '../utils/videoProcessor.js'
 import { useToast } from '../ui/Toast.jsx'
-import { EmptyState, SkeletonRows } from '../ui/Empty.jsx'
+import { SkeletonRows } from '../ui/Empty.jsx'
 import { ConfirmButton } from '../ui/Confirm.jsx'
 import { RenderProgress } from '../ui/RenderProgress.jsx'
 import { capPlanDuration, MOBILE_MAX_SECONDS } from '../utils/mobileLimits.js'
@@ -267,12 +267,10 @@ export default function QuickEdit({ reason }) {
           )}
 
           {!clips.length && !probing && (
-            <div className="qe-mt">
-              <EmptyState icon="🎬" title="No footage yet" compact>
-                Add a clip from your camera roll. Nothing is uploaded — the video is decoded and
-                rendered on this device.
-              </EmptyState>
-            </div>
+            <p className="qe-dim">
+              Nothing is uploaded — the video is decoded, planned and rendered on this device. Up to
+              3 minutes of finished edit.
+            </p>
           )}
         </section>
 

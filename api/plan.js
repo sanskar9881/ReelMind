@@ -14,12 +14,15 @@
 // VITE_-prefixed key ships to every visitor in plain text. `npm run build` runs
 // a guard (see vite.config.js) that fails the build if such a variable exists.
 //
-// Nothing here runs until USE_MOCK is flipped in src/utils/ai.js — see the
-// marked line there. This endpoint exists so the switch is a one-line change,
-// not a project.
+// This is now the live path (USE_MOCK is false in src/utils/ai.js). When it
+// errors for any reason the client falls back to the offline planner and says
+// so in the UI — an outage costs the user plan quality, never their edit.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const MODEL = 'claude-sonnet-4-5'
+// Claude Opus 5. The request this endpoint serves is an editorial judgement
+// over ~150 scored candidates — reasoning work, not extraction — so it runs
+// with adaptive thinking rather than a cheaper model at zero thinking.
+const MODEL = 'claude-opus-5'
 const MAX_BODY_BYTES = 200 * 1024 // transcripts get large; an unbounded body is an easy way to run up a bill
 const RATE_LIMIT = 20 // requests
 const RATE_WINDOW_MS = 60 * 60 * 1000 // per hour, per IP
@@ -122,7 +125,10 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({
         model: MODEL,
-        max_tokens: 4096,
+        // A 40-shot plan of id references is small, but a truncated response is
+        // an unparseable one — there is no partial credit on JSON.
+        max_tokens: 16000,
+        thinking: { type: 'adaptive' },
         messages: [{ role: 'user', content: prompt }],
       }),
     })

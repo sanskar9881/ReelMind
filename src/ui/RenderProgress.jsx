@@ -1,8 +1,14 @@
 import { useEffect, useState } from 'react'
 
+/** Every stage either engine emits, in plain words. An unmapped stage falls
+ *  through to its raw name rather than showing nothing. */
 const STAGE_LABELS = {
   engine: 'Loading render engine',
-  webcodecs: 'Encoding on GPU',
+  webcodecs: 'Starting GPU render',
+  demux: 'Reading source video',
+  video: 'Encoding video',
+  audio: 'Encoding audio',
+  mux: 'Writing the MP4',
   normalize: 'Normalizing clips',
   concat: 'Joining shots',
   fallback: 'Falling back to software',

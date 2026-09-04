@@ -36,9 +36,9 @@ import { RenderProgress } from '../ui/RenderProgress.jsx'
 const PX_PER_SEC = 26
 
 /** Left-hand panels, in tab order. In single-panel mode Export joins them. */
-const LEFT_TABS = ['clips', 'transcript', 'style', 'music', 'fx']
+const LEFT_TABS = ['clips', 'transcript', 'candidates', 'style', 'music', 'fx']
 const MOBILE_TABS = ['clips', 'transcript', 'style', 'export']
-const TAB_ICON = { clips: '🎞', transcript: '💬', style: '✦', music: '♪', fx: '✧', edit: '✂', grade: '◑', export: '⬇' }
+const TAB_ICON = { clips: '🎞', transcript: '💬', candidates: '☰', style: '✦', music: '♪', fx: '✧', edit: '✂', grade: '◑', export: '⬇' }
 const TAB_LABEL = { fx: 'FX', edit: 'Edit', grade: 'Grade', export: 'Export' }
 const tabLabel = (t) => TAB_LABEL[t] || t[0].toUpperCase() + t.slice(1)
 
@@ -102,6 +102,12 @@ export default function Editor() {
   const [aiState, setAiState] = useState('idle') // idle | thinking | done | error
   const [plan, setPlan] = useState(null)
   const [aiError, setAiError] = useState('')
+  // Every scored candidate the planner chose from. Held OUT of `plan` on
+  // purpose: the plan is autosaved to IndexedDB on every keystroke, and 400
+  // candidates with their score breakdowns would bloat every saved project.
+  const [candidates, setCandidates] = useState([])
+  const [candidateSort, setCandidateSort] = useState('score') // score | time
+  const [candidateFilter, setCandidateFilter] = useState('all') // all | used | rejected
 
   const [playing, setPlaying] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
@@ -743,13 +749,16 @@ export default function Editor() {
     setAiError('')
     setPlan(null)
     try {
-      const p = await generateEditPlan(
+      const full = await generateEditPlan(
         clips,
         prompt,
         analysis,
         transcriptsMap,
         applyStyle ? activeProfile : null,
       )
+      // Keep the candidate menu in component state, not on the saved plan.
+      const { candidates: scoredCandidates = [], ...p } = full
+      setCandidates(scoredCandidates)
       applyTextEdits(p)
       // Every generated plan gets an id so ratings and corrections attach to a
       // specific edit rather than to the project as a whole.
@@ -757,6 +766,14 @@ export default function Editor() {
       setPlan(p)
       setRating(null) // a new plan is unrated
       setAiState('done')
+      if (p.plannedBy === 'offline' && p.fallbackReason) {
+        toast.error('Planned offline', p.fallbackReason)
+      } else {
+        toast.success(
+          p.plannedBy === 'claude' ? 'Planned by Claude' : 'Planned offline',
+          `${p.segments.length} moments from ${p.candidateStats?.generated ?? '?'} candidates`,
+        )
+      }
       saveFeedback({
         planId: p.planId,
         projectId: projectIdRef.current,
@@ -771,7 +788,7 @@ export default function Editor() {
       setAiError(err.message || 'Planning failed.')
       setAiState('error')
     }
-  }, [clips, prompt, aiState, analysis, transcriptsMap, applyTextEdits, applyStyle, activeProfile, projectName])
+  }, [clips, prompt, aiState, analysis, transcriptsMap, applyTextEdits, applyStyle, activeProfile, projectName, toast])
 
   const rateEdit = useCallback(
     (value) => {
@@ -957,6 +974,9 @@ export default function Editor() {
         start: s.start,
         role: s.role,
         transition: s.transition,
+        score: s.score,
+        breakdown: s.breakdown,
+        text: s.text,
       }))
     }
     return clips.map((c, i) => ({
@@ -1023,11 +1043,37 @@ export default function Editor() {
     resolution,
   ])
 
+  // ---- candidates view ---------------------------------------------------
+  const usedCandidateIds = useMemo(
+    () => new Set((plan?.segments || []).map((s2) => s2.candidateId).filter(Boolean)),
+    [plan],
+  )
+
+  const shownCandidates = useMemo(() => {
+    let list = candidates
+    if (candidateFilter === 'used') list = list.filter((c) => usedCandidateIds.has(c.id))
+    else if (candidateFilter === 'rejected') list = list.filter((c) => !usedCandidateIds.has(c.id))
+    const sorted = [...list]
+    if (candidateSort === 'time') {
+      const order = new Map(clips.map((c, i) => [c.id, i]))
+      sorted.sort((a, b) => (order.get(a.clipId) ?? 0) - (order.get(b.clipId) ?? 0) || a.start - b.start)
+    } else {
+      sorted.sort((a, b) => b.score - a.score)
+    }
+    // The panel is a tuning tool, not an archive — 400 rows of DOM is slow and
+    // nobody reads past the first hundred.
+    return sorted.slice(0, 200)
+  }, [candidates, candidateFilter, candidateSort, usedCandidateIds, clips])
+
   // ---- layout mode -------------------------------------------------------
   // Derived, not stored: a resize must not leave a panel floating over a
   // layout that no longer has anywhere to put it.
-  const singleMode = mode === 'single'
-  const railMode = mode === 'rail'
+  // Below 768 the route normally renders Quick Edit; the editor only sees
+  // 'quick' when someone forced it with ?full=1, and the single-panel layout is
+  // the right degradation for it — never the three-pane one.
+  const layout = mode === 'quick' ? 'single' : mode
+  const singleMode = layout === 'single'
+  const railMode = layout === 'rail'
   const rightOverlayOpen = railMode && railOpen
   const timelineSheet = singleMode && sheetOpen
   // 'export' is a left tab only when there is a single panel to put it in.
@@ -1149,14 +1195,19 @@ export default function Editor() {
                 aria-selected={i === tlFocus}
                 className={`ed-block role-${b.role}${i === tlFocus ? ' is-cursor' : ''}`}
                 style={{ width: Math.max(56, b.len * PX_PER_SEC) }}
-                title={`${b.name} · ${b.len.toFixed(1)}s${b.transition ? ` · ${b.transition}` : ''}`}
+                title={blockTitle(b)}
                 onClick={() => {
                   setTlFocus(i)
                   selectBlock(b)
                 }}
               >
                 <span className="ed-block-name">{b.name}</span>
-                <span className="ed-block-len">{b.len.toFixed(1)}s</span>
+                <span className="ed-block-len">
+                  {b.len.toFixed(1)}s
+                  {Number.isFinite(b.score) && (
+                    <span className="ed-block-score">{Math.round(b.score * 100)}</span>
+                  )}
+                </span>
               </div>
             ))
           ) : (
@@ -1199,7 +1250,7 @@ export default function Editor() {
   )
 
   return (
-    <div className={`ed mode-${mode}`}>
+    <div className={`ed mode-${layout}`}>
       <style>{CSS}</style>
 
       {/* Reopen: the browser cannot keep file access between sessions. */}
@@ -1489,9 +1540,9 @@ export default function Editor() {
                 ))}
                 {probing && !clips.length && <SkeletonRows count={3} />}
                 {!clips.length && !probing && (
-                  <EmptyState icon="🎞" title="No clips yet" compact>
-                    Drop footage on the zone above — phone video, drone shots, screen recordings.
-                    ReelMind probes each file locally for its real duration and resolution.
+                  <EmptyState icon="🎞" title="Your clip library is empty" compact>
+                    Added footage lands here with its real duration, resolution and analysis meters —
+                    all probed locally, nothing uploaded.
                   </EmptyState>
                 )}
               </div>
@@ -1741,6 +1792,99 @@ export default function Editor() {
                         : 'Transcribe a clip to generate captions.'}
                     </p>
                   </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {activeLeftTab === 'candidates' && (
+            <div className="ed-side-scroll">
+              {!candidates.length ? (
+                <EmptyState icon="☰" title="No candidates yet" compact>
+                  Generate a plan and every scored moment the planner considered shows up here —
+                  including the ones it rejected. This is how you see what the weights are doing.
+                </EmptyState>
+              ) : (
+                <>
+                  <div className="ed-cand-head">
+                    <div className="ed-cand-sum">
+                      {candidates.length} scored ·{' '}
+                      <span className="ed-ok">{usedCandidateIds.size || plan?.segments?.length || 0} used</span>
+                      {plan?.candidateStats?.generated ? (
+                        <span className="ed-dim"> · {plan.candidateStats.generated} generated</span>
+                      ) : null}
+                    </div>
+                    {plan?.candidateStats?.scoreFloor != null && (
+                      <div className="ed-dim">
+                        Offline quality floor was {Math.round(plan.candidateStats.scoreFloor * 100)} —
+                        anything below it was not eligible.
+                      </div>
+                    )}
+                    <div className="ed-caps-row">
+                      <span className="ed-dim">Show</span>
+                      {['all', 'used', 'rejected'].map((f) => (
+                        <button
+                          key={f}
+                          className={`ed-seg-btn${candidateFilter === f ? ' is-on' : ''}`}
+                          onClick={() => setCandidateFilter(f)}
+                        >
+                          {f}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="ed-caps-row">
+                      <span className="ed-dim">Sort</span>
+                      {[
+                        ['score', 'score'],
+                        ['time', 'in order'],
+                      ].map(([v, label]) => (
+                        <button
+                          key={v}
+                          className={`ed-seg-btn${candidateSort === v ? ' is-on' : ''}`}
+                          onClick={() => setCandidateSort(v)}
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <ul className="ed-cand-list">
+                    {shownCandidates.map((c) => {
+                      const used = usedCandidateIds.has(c.id)
+                      return (
+                        <li key={c.id} className={`ed-cand${used ? ' is-used' : ''}`}>
+                          <button
+                            className="ed-cand-btn"
+                            onClick={() => {
+                              setSelectedId(c.clipId)
+                              requestAnimationFrame(() => seekPreview(c.start))
+                            }}
+                            title={`Scrub to ${fmtTime(c.start)} in ${c.clip}\n${breakdownLine(c.breakdown)}`}
+                          >
+                            <span className="ed-cand-top">
+                              <span className={`ed-cand-score${used ? ' is-used' : ''}`}>
+                                {Math.round(c.score * 100)}
+                              </span>
+                              <span className="ed-cand-where">
+                                {c.clip} · {fmtTime(c.start)} · {(c.end - c.start).toFixed(1)}s
+                              </span>
+                              {used && <span className="ed-cand-tag">in edit</span>}
+                            </span>
+                            <span className="ed-cand-text">
+                              {c.text || <em className="ed-dim">no speech — scored on audio and picture</em>}
+                            </span>
+                            <span className="ed-cand-bd">{breakdownLine(c.breakdown)}</span>
+                          </button>
+                        </li>
+                      )
+                    })}
+                  </ul>
+                  {shownCandidates.length < candidates.length && candidateFilter === 'all' && (
+                    <p className="ed-dim ed-mt">
+                      Showing the top {shownCandidates.length} of {candidates.length}.
+                    </p>
+                  )}
                 </>
               )}
             </div>
@@ -2026,6 +2170,18 @@ export default function Editor() {
               {aiState === 'error' && <span className="ed-bad">{aiError}</span>}
               {aiState === 'done' && plan && (
                 <span className="ed-ok">
+                  <span
+                    className={`ed-planby${plan.plannedBy === 'claude' ? ' is-claude' : ''}`}
+                    title={
+                      plan.plannedBy === 'claude'
+                        ? 'Claude chose these moments from the scored candidates.'
+                        : plan.fallbackReason
+                          ? `The planning service was unavailable — ${plan.fallbackReason}`
+                          : 'Selected locally from the scored candidates. No model was called.'
+                    }
+                  >
+                    {plan.plannedBy === 'claude' ? 'Planned by Claude' : 'Offline planner'}
+                  </span>{' '}
                   <strong>{plan.title}</strong> — {plan.reasoning}{' '}
                   <span className="ed-dim">
                     ({plan.segments.length} segments · {plan.music} music
@@ -2124,7 +2280,7 @@ export default function Editor() {
               </button>
             </div>
           )}
-          {!singleMode && (
+          {!singleMode && !railMode && (
             <div className="ed-tabs" role="tablist" aria-label="Right panel">
               {['edit', 'grade', 'export'].map((t) => (
                 <button
@@ -2267,6 +2423,33 @@ export default function Editor() {
                   {smoke.log.map((line, i) => (
                     <div key={i}>{line}</div>
                   ))}
+                </div>
+              )}
+
+              {plan?.candidateStats && (
+                <div className="ed-selratio">
+                  <div className="ed-selratio-main">
+                    Selected {plan.segments.length} moment{plan.segments.length === 1 ? '' : 's'} from{' '}
+                    {plan.candidateStats.generated} candidates, {fmtTime(plan.candidateStats.outputSeconds)}{' '}
+                    from {fmtTime(plan.candidateStats.footageSeconds)} of footage
+                  </div>
+                  <div className="ed-dim">
+                    {plan.candidateStats.footageSeconds
+                      ? `${Math.round((plan.candidateStats.outputSeconds / plan.candidateStats.footageSeconds) * 100)}% kept`
+                      : ''}
+                    {' · target '}
+                    {fmtTime(plan.candidateStats.targetDuration)}
+                    {plan.candidateStats.underTarget ? ' · came in under it deliberately' : ''}
+                    {plan.candidateStats.relaxed?.length
+                      ? ` · relaxed ${plan.candidateStats.relaxed.join(', ')}`
+                      : ''}
+                    {plan.candidateStats.merged ? ` · merged ${plan.candidateStats.merged} abutting` : ''}
+                  </div>
+                  <button className="ed-linkbtn" onClick={() => setLeftTab('candidates')}>
+                    See all {plan.candidateStats.generated > plan.candidateStats.scored
+                      ? `${plan.candidateStats.scored} scored`
+                      : 'scored'} candidates
+                  </button>
                 </div>
               )}
 
@@ -2504,6 +2687,33 @@ export default function Editor() {
       </span>
     </div>
   )
+}
+
+/** Hover text for a timeline block: the score and what produced it. */
+function blockTitle(b) {
+  const base = `${b.name} · ${b.len.toFixed(1)}s${b.transition ? ` · ${b.transition}` : ''}`
+  if (!Number.isFinite(b.score)) return base
+  const g = b.breakdown?.groups || {}
+  const w = b.breakdown?.weights || {}
+  const parts = Object.keys(g).map(
+    (k) => `  ${k}: ${(g[k] * 100).toFixed(0)}  (weight ${(w[k] * 100).toFixed(0)}%)`,
+  )
+  return [
+    base,
+    `score ${(b.score * 100).toFixed(0)} / 100`,
+    ...parts,
+    b.text ? `\n“${b.text.slice(0, 140)}”` : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
+/** One-line summary of a score breakdown, for the candidates list. */
+function breakdownLine(breakdown) {
+  const g = breakdown?.groups || {}
+  return Object.keys(g)
+    .map((k) => `${k.slice(0, 3)} ${Math.round(g[k] * 100)}`)
+    .join(' · ')
 }
 
 function Meter({ label, v }) {
@@ -2800,6 +3010,40 @@ const CSS = `
 .ed-role { font-size: 9.5px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border); flex: none; }
 .ed-role.role-hook { color: var(--cyan); border-color: var(--cyan); }
 .ed-role.role-outro { color: var(--pink); border-color: rgba(255,37,102,.5); }
+
+/* planner provenance + candidate inspection */
+.ed-planby { display: inline-block; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+  padding: 2px var(--s2); border-radius: 999px; border: 1px solid var(--muted-line); color: var(--muted); vertical-align: 1px; }
+.ed-planby.is-claude { border-color: var(--cyan); color: var(--cyan); background: rgba(9,246,255,.1); }
+
+.ed-block-score { display: inline-block; margin-left: var(--s1); padding: 0 4px; border-radius: 4px; font-size: 9px; font-weight: 700;
+  background: rgba(255,255,255,.1); color: var(--text); font-variant-numeric: tabular-nums; }
+
+.ed-selratio { margin-top: var(--s4); padding: var(--s3); border-radius: var(--r-md); border: 1px solid var(--border); background: var(--surface);
+  display: flex; flex-direction: column; gap: var(--s1); }
+.ed-selratio-main { font-size: 12px; font-weight: 600; line-height: 1.5; }
+
+.ed-cand-head { display: flex; flex-direction: column; gap: var(--s2); padding-bottom: var(--s3); border-bottom: 1px solid var(--border); }
+.ed-cand-sum { font-size: 12px; font-weight: 600; }
+.ed-cand-list { list-style: none; margin: var(--s3) 0 0; padding: 0; display: flex; flex-direction: column; gap: var(--s2); }
+.ed-cand { border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); overflow: hidden; }
+.ed-cand.is-used { border-color: var(--purple); background: rgba(155,93,255,.08); }
+.ed-cand-btn { display: flex; flex-direction: column; gap: var(--s1); width: 100%; text-align: left; background: none; border: none;
+  padding: var(--s2) var(--s3); color: var(--text); }
+.ed-cand-btn:hover { background: rgba(255,255,255,.03); }
+.ed-cand-top { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+.ed-cand-score { flex: none; min-width: 28px; text-align: center; font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums;
+  padding: 1px var(--s1); border-radius: var(--r-sm); border: 1px solid var(--border); color: var(--muted); }
+.ed-cand-score.is-used { border-color: var(--purple); color: var(--purple); }
+.ed-cand-where { font-size: 10px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ed-cand-tag { margin-left: auto; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--purple); }
+.ed-cand-text { font-size: 11.5px; line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.ed-cand-bd { font-size: 9.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+/* Six tabs do not fit a 210px panel; let the strip scroll rather than squash. */
+.ed-tabs { overflow-x: auto; scrollbar-width: none; }
+.ed-tabs::-webkit-scrollbar { display: none; }
+.ed-tab { flex: 1 0 auto; min-width: 52px; }
 
 /* ---------------------------------------------------------------------
    Shared chrome for the smaller layouts

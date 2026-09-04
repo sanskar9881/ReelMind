@@ -26,6 +26,9 @@ Browser-based AI vlog editor. Vite + React. No backend yet.
 - render() opts.forceEngine ('webcodecs'|'ffmpeg') bypasses the capability check; a forced 'webcodecs' failure is THROWN, not silently fallen back
 
 - src/utils/storage.js — IndexedDB project persistence (projects / clipRefs / profiles). A File CANNOT be persisted across sessions: store metadata+analysis+transcript+plan, then match re-selected files by name+size and restore without recomputing. FileSystemFileHandle path (Chrome/Edge) skips re-selection; feature-detected
+- src/ui/useResponsive.js — the ONE place breakpoints live: >=1280 full / >=1024 rail / >=768 single / below quick. useQuickEditGate() ORs the viewport with navigator.deviceMemory < 4GB, so a wide low-RAM device also gets Quick Edit; `?full=1` overrides. App.jsx routes /editor through it
+- src/pages/QuickEdit.jsx — mobile flow: upload → prompt → render → download. 720p only, and capPlanDuration() (src/utils/mobileLimits.js) HARD-CAPS output at 180s — whole shots dropped first, then the last one trimmed. Not a "desktop only" wall; it renders a real MP4
+- src/ui/ — Toast (bottom-right desktop / top mobile, errors never auto-dismiss), ConfirmButton (inline two-step; window.confirm blocks the tab and mobile Safari can suppress it), EmptyState + SkeletonRows, RenderProgress (stage label + live elapsed — a silent bar on a 3-minute render reads as hung)
 - api/plan.js — the ONLY place ANTHROPIC_API_KEY exists. Never VITE_-prefixed (Vite inlines VITE_* into the client bundle). vite.config.js secretGuard fails the build on a VITE_*SECRET-ish var or an sk-ant- literal in the bundle
 
 ## Rules
@@ -43,7 +46,10 @@ Browser-based AI vlog editor. Vite + React. No backend yet.
 - Every internal cut needs splice hygiene: coalesce exclude ranges (<0.12s gap), merge sub-0.25s survivors, snap audio to zero crossings, equal-power edge-fade. Splices are butt-joins; transitions are overlaps — keep both code paths
 - A/V SYNC: audio slice length per segment MUST equal round(round(segDur*FPS)/FPS*RATE) samples — snap the in-point to a zero crossing for the click, then force the length back. Never let the zero-crossing snap change segment length (it accumulates). FFmpeg path uses `-t <dur>` on the output, not `-shortest`
 - Every render is auto-verified (verifyRender + measureSync). A "real render confirmed correct" bar, not "looks done"
-- Palette: bg #05050A, panels #0B0B14, cyan #09F6FF, purple #9B5DFF, muted #6464A0
+- Palette: bg #05050A, panels #0B0B14, cyan #09F6FF, purple #9B5DFF. --muted is #8484C0 (5.6:1 on --panel); the old #6464A0 measured 3.6:1 and survives only as --muted-line for borders and dots, which carry no text
+- Spacing, radii, --side-w/--rail-w/--timeline-h and --tap all come from :root in index.css. --tap is 32px on a mouse and 44px under (pointer: coarse) — use it instead of hard-coding a control height
+- Editor layout is one derived string: `layout` ('full' | 'rail' | 'single'), which sets both the `mode-*` class and the singleMode/railMode booleans. 'quick' collapses into 'single' so a forced editor on a phone degrades instead of stacking three panes. Nothing about layout is stored in state — a resize must not strand a panel over a layout with no room for it
+- [hidden] is `display: none !important` globally: .ed-side sets its own display, which would otherwise beat the UA's [hidden] rule and leave a hidden panel on screen
 - Fonts: Syne (headings), DM Sans (body)
 - USE_MOCK in src/utils/ai.js is still true — flipping that one line is the only step to go live
 - buildPrompt samples sentences for clips over 3 min (first/last 15 + every 3rd, flagged as "sentencesSampled" with a rule telling the model gaps are unshown speech, not silence). Replaced a slice(0,40) that silently showed only the opening 10% of a 30-min clip. Measured: 2h of footage = 81KB / ~23k tokens

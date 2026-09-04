@@ -30,7 +30,7 @@ export function ToastProvider({ children }) {
     (toast) => {
       const id = `t_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`
       const t = { id, tone: 'info', ...toast }
-      setToasts((prev) => [...prev.slice(-3), t])
+      setToasts((prev) => [...prev.slice(-2), t])
       if (t.tone !== 'error') {
         timers.current.set(
           id,
