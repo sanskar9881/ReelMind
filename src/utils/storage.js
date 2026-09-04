@@ -16,10 +16,11 @@
 // entirely after a permission prompt. Feature-detected, never depended on.
 
 const DB_NAME = 'reelmind'
-const DB_VERSION = 1
+const DB_VERSION = 2
 const STORE_PROJECTS = 'projects'
 const STORE_CLIPREFS = 'clipRefs'
 const STORE_PROFILES = 'profiles'
+const STORE_FEEDBACK = 'feedback'
 const LEGACY_PROFILE_KEY = 'reelmind.styleProfiles'
 
 let _db = null
@@ -39,6 +40,11 @@ function openDB() {
       }
       if (!db.objectStoreNames.contains(STORE_PROFILES)) {
         db.createObjectStore(STORE_PROFILES, { keyPath: 'id' })
+      }
+      // v2: edit-quality signal. Local only — nothing is transmitted.
+      if (!db.objectStoreNames.contains(STORE_FEEDBACK)) {
+        const s = db.createObjectStore(STORE_FEEDBACK, { keyPath: 'planId' })
+        s.createIndex('projectId', 'projectId', { unique: false })
       }
     }
     req.onsuccess = () => {
@@ -411,6 +417,61 @@ export async function migrateLegacyProfiles() {
   }
   if (migrated) console.info(`[storage] migrated ${migrated} style profile(s) from localStorage`)
   return { migrated, activeId: parsed?.activeId ?? null }
+}
+
+// ---- edit-quality signal (local only, never transmitted) ---------------
+//
+// The pipeline is verified; the EDITS are not. A rating alone is too coarse —
+// what actually says whether the planner is good is how much the user had to
+// fix afterwards. Corrections per edit is the honest metric, and it is the raw
+// material for improving mockPlan and the Claude prompt.
+
+/**
+ * Record or update the signal for one generated plan.
+ * @param {object} entry { planId, projectId, rating?, prompt, profileName, engine,
+ *   segmentCount, corrections?, sampledPrompt? }
+ */
+export async function saveFeedback(entry) {
+  if (!entry?.planId) return null
+  const existing = await tx(STORE_FEEDBACK, 'readonly', (s) => s.get(entry.planId))
+  const record = {
+    corrections: [],
+    createdAt: new Date().toISOString(),
+    ...(existing || {}),
+    ...entry,
+    updatedAt: new Date().toISOString(),
+  }
+  await tx(STORE_FEEDBACK, 'readwrite', (s) => s.put(record))
+  return record
+}
+
+/** Append one correction to a plan's record, creating it if needed. */
+export async function recordCorrection(planId, correction, seed = {}) {
+  if (!planId) return null
+  const existing = await tx(STORE_FEEDBACK, 'readonly', (s) => s.get(planId))
+  const record = {
+    planId,
+    corrections: [],
+    createdAt: new Date().toISOString(),
+    ...(existing || seed),
+    ...(existing ? {} : seed),
+  }
+  record.corrections = [
+    ...(record.corrections || []),
+    { ...correction, at: new Date().toISOString() },
+  ]
+  record.updatedAt = new Date().toISOString()
+  await tx(STORE_FEEDBACK, 'readwrite', (s) => s.put(record))
+  return record
+}
+
+export async function listFeedback() {
+  const all = await tx(STORE_FEEDBACK, 'readonly', (s) => s.getAll())
+  return (all || []).sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''))
+}
+
+export async function clearFeedback() {
+  await tx(STORE_FEEDBACK, 'readwrite', (s) => s.clear())
 }
 
 /** True when IndexedDB is usable at all (private modes can refuse). */

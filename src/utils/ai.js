@@ -13,6 +13,29 @@ export const USE_MOCK = true
  * Build the Claude prompt string. Lists the clip inventory as JSON, states the
  * user's request, and demands ONLY the plan JSON back (no markdown fences).
  */
+// Sentence sampling for the prompt.
+//
+// This replaced a blunt `slice(0, 40)` that silently discarded everything past
+// the first 40 sentences — on a 30-minute clip the model saw 10% of the video,
+// all from the opening, and had no way to know. Sampling keeps coverage across
+// the whole clip and stays far under any token concern (measured: 60 minutes of
+// footage across 6 clips is ~44KB / ~12k tokens).
+const SAMPLE_OVER_SECONDS = 180 // clips under 3 minutes are sent whole
+const SAMPLE_HEAD_TAIL = 15
+const SAMPLE_STRIDE = 3
+
+export function sampleSentences(sentences, durationSec) {
+  if ((durationSec ?? 0) < SAMPLE_OVER_SECONDS || sentences.length <= SAMPLE_HEAD_TAIL * 2) {
+    return { list: sentences, sampled: false }
+  }
+  const head = sentences.slice(0, SAMPLE_HEAD_TAIL)
+  const tail = sentences.slice(-SAMPLE_HEAD_TAIL)
+  const middle = sentences
+    .slice(SAMPLE_HEAD_TAIL, sentences.length - SAMPLE_HEAD_TAIL)
+    .filter((_, i) => i % SAMPLE_STRIDE === 0)
+  return { list: [...head, ...middle, ...tail], sampled: true }
+}
+
 export function buildPrompt(clips, userPrompt, transcripts, profile) {
   const T = transcripts instanceof Map ? transcripts : null
 
@@ -24,17 +47,22 @@ export function buildPrompt(clips, userPrompt, transcripts, profile) {
     }
     const tr = T && T.get(c.id)
     if (tr && !tr.error && tr.sentences?.length) {
-      // Cap sentences per clip to keep the token count sane on long footage.
-      entry.sentences = tr.sentences.slice(0, 40).map((s) => ({
+      const { list, sampled } = sampleSentences(tr.sentences, c.duration)
+      entry.sentences = list.map((s) => ({
         text: s.text,
         start: Number(s.start.toFixed(2)),
         end: Number(s.end.toFixed(2)),
       }))
+      if (sampled) {
+        entry.sentencesSampled = true
+        entry.sentencesTotal = tr.sentences.length
+      }
     }
     return entry
   })
 
   const hasTranscripts = inventory.some((c) => c.sentences)
+  const anySampled = inventory.some((c) => c.sentencesSampled)
 
   // Retake groups — repeated attempts at one line — so the model uses just one.
   const retakeBlocks = []
@@ -85,6 +113,16 @@ RULES:
   mid-sentence. Choose segments for narrative meaning — the hook should be
   the most compelling thing actually said, not merely the loudest moment.
   Keep a spoken thought intact even if it runs longer than the target pace.`
+      : ''
+  }${
+    anySampled
+      ? `
+- A clip marked "sentencesSampled": true shows a REPRESENTATIVE SAMPLE of its
+  speech, not every line — the first 15 and last 15 sentences plus every third
+  one in between, out of "sentencesTotal". Every timestamp shown is exact, but a
+  gap between two consecutive sampled sentences is unshown speech, NOT silence.
+  Do not treat those gaps as pauses to cut on, and do not assume the clip ends
+  at the last sentence you can see.`
       : ''
   }${
     retakeBlocks.length

@@ -4,7 +4,7 @@ import { probeAll, fmtTime, fmtSize } from '../utils/videoMeta.js'
 import { analyzeAll, withTranscript } from '../utils/analyzer.js'
 import { transcribeClip } from '../utils/transcribe.js'
 import { extendTakeRange } from '../utils/retakes.js'
-import { generateEditPlan, USE_MOCK } from '../utils/ai.js'
+import { generateEditPlan, USE_MOCK, buildPrompt } from '../utils/ai.js'
 import { render, estimateRenderSeconds, applyCutRanges } from '../utils/videoProcessor.js'
 import { checkWebCodecsSupport } from '../utils/webcodecs/support.js'
 import { verifyRender, measureSync } from '../utils/verify.js'
@@ -23,6 +23,9 @@ import {
   deleteProfileDB,
   getActiveProfileId,
   setActiveProfileId as persistActiveProfileId,
+  saveFeedback,
+  recordCorrection,
+  listFeedback,
 } from '../utils/storage.js'
 
 const PX_PER_SEC = 26
@@ -91,6 +94,10 @@ export default function Editor() {
   const [engine, setEngine] = useState(null) // checkWebCodecsSupport() result
   const [verifyState, setVerifyState] = useState(null) // { running, report, sync } | null
   const [verifyOpen, setVerifyOpen] = useState(false)
+
+  // Edit-quality signal (local only, never transmitted)
+  const [rating, setRating] = useState(null) // null until the user answers
+  const [qualityView, setQualityView] = useState(null) // dev-only feedback list
   const [diagnostics, setDiagnostics] = useState(false)
   const [smoke, setSmoke] = useState(null) // { running, log[], ok } | null
 
@@ -128,6 +135,36 @@ export default function Editor() {
   )
 
   const hasCaptions = Object.keys(captionCuesByClip).length > 0
+
+  // Dev-only: exactly what buildPrompt would send for this project, so the real
+  // token cost is a known number before USE_MOCK is ever flipped.
+  const promptStats = useMemo(() => {
+    if (!import.meta.env.DEV || !clips.length) return null
+    try {
+      const text = buildPrompt(
+        clips,
+        prompt,
+        transcriptsMap,
+        applyStyle ? activeProfile : null,
+      )
+      const bytes = new TextEncoder().encode(text).length
+      const totalSentences = Object.values(transcripts).reduce(
+        (a, t) => a + (t?.sentences?.length || 0),
+        0,
+      )
+      const sentInPrompt = (text.match(/"text":/g) || []).length
+      return {
+        bytes,
+        kb: bytes / 1024,
+        tokens: Math.round(text.length / 3.6), // chars/3.6 ≈ Claude tokens
+        sampled: /"sentencesSampled": true/.test(text),
+        sentInPrompt,
+        totalSentences,
+      }
+    } catch {
+      return null
+    }
+  }, [clips, prompt, transcriptsMap, transcripts, applyStyle, activeProfile])
 
   const activeProfile = useMemo(
     () => profiles.find((p) => p.id === activeProfileId) || null,
@@ -268,12 +305,41 @@ export default function Editor() {
     [retakeExcludeRanges],
   )
 
-  const chooseTake = useCallback((clipId, groupId, sentenceIndex) => {
-    setRetakeChoice((prev) => ({
-      ...prev,
-      [clipId]: { ...(prev[clipId] || {}), [groupId]: sentenceIndex },
-    }))
+  // ---- edit-quality signal (local only, never transmitted) --------------
+  // Held in a ref and synced from an effect so logCorrection can stay stable and
+  // be called from handlers declared anywhere in the component.
+  const feedbackCtxRef = useRef({})
+  useEffect(() => {
+    feedbackCtxRef.current = {
+      planId: plan?.planId ?? null,
+      projectId: projectIdRef.current,
+      projectName,
+      prompt,
+      profileName: applyStyle && activeProfile ? activeProfile.name : null,
+      segmentCount: plan?.segments?.length ?? 0,
+    }
+  })
+
+  /** A manual fix to a generated plan — corrections per edit is the honest
+   *  measure of whether the planner is any good. */
+  const logCorrection = useCallback((field, segmentIndex, before, after) => {
+    const ctx = feedbackCtxRef.current
+    if (!ctx.planId) return // nothing generated yet — not a correction
+    recordCorrection(ctx.planId, { field, segmentIndex, before, after }, ctx).catch(() => {})
   }, [])
+
+  const chooseTake = useCallback(
+    (clipId, groupId, sentenceIndex) => {
+      setRetakeChoice((prev) => {
+        const before = prev[clipId]?.[groupId]
+        if (before !== sentenceIndex) {
+          logCorrection('retakeChoice', null, before ?? 'recommended', sentenceIndex)
+        }
+        return { ...prev, [clipId]: { ...(prev[clipId] || {}), [groupId]: sentenceIndex } }
+      })
+    },
+    [logCorrection],
+  )
 
   // Decorate a fresh plan with the current text-editing decisions.
   const applyTextEdits = useCallback(
@@ -610,13 +676,17 @@ export default function Editor() {
     setTranscribing(null)
   }, [transcribing, clips, transcripts, mergeTranscript])
 
-  const toggleStruck = useCallback((clipId, idx) => {
-    setStruck((prev) => {
-      const cur = prev[clipId] || []
-      const has = cur.includes(idx)
-      return { ...prev, [clipId]: has ? cur.filter((i) => i !== idx) : [...cur, idx] }
-    })
-  }, [])
+  const toggleStruck = useCallback(
+    (clipId, idx) => {
+      setStruck((prev) => {
+        const cur = prev[clipId] || []
+        const has = cur.includes(idx)
+        logCorrection(has ? 'lineRestored' : 'lineStruck', null, idx, has ? 'kept' : 'excluded')
+        return { ...prev, [clipId]: has ? cur.filter((i) => i !== idx) : [...cur, idx] }
+      })
+    },
+    [logCorrection],
+  )
 
   // ---- AI plan -----------------------------------------------------------
   const runGenerate = useCallback(async () => {
@@ -633,13 +703,70 @@ export default function Editor() {
         applyStyle ? activeProfile : null,
       )
       applyTextEdits(p)
+      // Every generated plan gets an id so ratings and corrections attach to a
+      // specific edit rather than to the project as a whole.
+      p.planId = `plan_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`
       setPlan(p)
+      setRating(null) // a new plan is unrated
       setAiState('done')
+      saveFeedback({
+        planId: p.planId,
+        projectId: projectIdRef.current,
+        projectName,
+        prompt,
+        profileName: applyStyle && activeProfile ? activeProfile.name : null,
+        segmentCount: p.segments.length,
+        planDuration: p.segments.reduce((a, s) => a + (s.end - s.start), 0),
+        usedMock: USE_MOCK,
+      }).catch(() => {})
     } catch (err) {
       setAiError(err.message || 'Planning failed.')
       setAiState('error')
     }
-  }, [clips, prompt, aiState, analysis, transcriptsMap, applyTextEdits, applyStyle, activeProfile])
+  }, [clips, prompt, aiState, analysis, transcriptsMap, applyTextEdits, applyStyle, activeProfile, projectName])
+
+  const rateEdit = useCallback(
+    (value) => {
+      setRating(value)
+      const ctx = feedbackCtxRef.current
+      if (!ctx.planId) return
+      saveFeedback({ ...ctx, rating: value, engine: result?.method ?? null }).catch(() => {})
+    },
+    [result],
+  )
+
+  // Trim or drop a shot from the generated plan, recording each change.
+  const adjustSegment = useCallback(
+    (index, field, deltaSec) => {
+      setPlan((prev) => {
+        if (!prev?.segments?.[index]) return prev
+        const segs = prev.segments.map((s) => ({ ...s }))
+        const s = segs[index]
+        const before = s[field]
+        const next =
+          field === 'start'
+            ? Math.max(0, Math.min(s.end - 0.7, before + deltaSec))
+            : Math.max(s.start + 0.7, before + deltaSec)
+        if (Math.abs(next - before) < 0.01) return prev
+        s[field] = +next.toFixed(3)
+        logCorrection(field, index, +before.toFixed(3), s[field])
+        return { ...prev, segments: segs }
+      })
+    },
+    [logCorrection],
+  )
+
+  const dropSegment = useCallback(
+    (index) => {
+      setPlan((prev) => {
+        if (!prev?.segments?.[index]) return prev
+        const removed = prev.segments[index]
+        logCorrection('removed', index, `${removed.clip} ${removed.start}–${removed.end}`, null)
+        return { ...prev, segments: prev.segments.filter((_, i) => i !== index) }
+      })
+    },
+    [logCorrection],
+  )
 
   // ---- render -----------------------------------------------------------
   const diagLog = useCallback((d) => {
@@ -1776,6 +1903,21 @@ export default function Editor() {
                 />
                 <span>Diagnostics (per-segment console log)</span>
               </label>
+
+              {import.meta.env.DEV && promptStats && (
+                <div className={`ed-promptsize${promptStats.kb > 150 ? ' is-over' : ''}`}>
+                  <div className="ed-promptsize-head">
+                    Prompt payload · {promptStats.kb.toFixed(1)} KB ·{' '}
+                    ~{promptStats.tokens.toLocaleString()} tokens
+                  </div>
+                  <div className="ed-dim">
+                    {promptStats.totalSentences > 0
+                      ? `${promptStats.sentInPrompt} of ${promptStats.totalSentences} sentences${promptStats.sampled ? ' (sampled across full clip length)' : ''}`
+                      : 'no transcripts yet'}
+                    {promptStats.kb > 150 && ' · over the 150KB budget'}
+                  </div>
+                </div>
+              )}
 
               {import.meta.env.DEV && (
                 <button

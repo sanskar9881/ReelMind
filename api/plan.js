@@ -58,9 +58,11 @@ export default async function handler(req, res) {
 
   const key = process.env.ANTHROPIC_API_KEY
   if (!key) {
+    // 503, not 500: the service is deliberately unconfigured, not broken. The
+    // client shows this message verbatim instead of a crash.
     return fail(
       res,
-      500,
+      503,
       'not_configured',
       'The planning service is not configured. Set ANTHROPIC_API_KEY in the deployment environment.',
     )
