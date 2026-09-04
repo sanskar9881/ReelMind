@@ -5,9 +5,10 @@ import { analyzeAll, withTranscript } from '../utils/analyzer.js'
 import { transcribeClip } from '../utils/transcribe.js'
 import { extendTakeRange } from '../utils/retakes.js'
 import { generateEditPlan, USE_MOCK } from '../utils/ai.js'
-import { render, estimateRenderSeconds } from '../utils/videoProcessor.js'
+import { render, estimateRenderSeconds, applyCutRanges } from '../utils/videoProcessor.js'
 import { checkWebCodecsSupport } from '../utils/webcodecs/support.js'
 import { verifyRender, measureSync } from '../utils/verify.js'
+import { buildCaptions, remapToOutputTimeline, toSRT, toVTT } from '../utils/captions.js'
 
 const PX_PER_SEC = 26
 
@@ -30,6 +31,12 @@ export default function Editor() {
   const [removeFillers, setRemoveFillers] = useState(false)
   const [retakeChoice, setRetakeChoice] = useState({}) // { [clipId]: { [groupId]: sentenceIndex } }
   const [keepAllTakes, setKeepAllTakes] = useState(false)
+
+  // Captions — built from transcript word timings, optionally burned into video.
+  const [burnCaptions, setBurnCaptions] = useState(false)
+  const [captionSize, setCaptionSize] = useState('M') // S | M | L
+  const [captionPos, setCaptionPos] = useState('bottom') // bottom | top
+  const [captionBg, setCaptionBg] = useState(false)
 
   const [prompt, setPrompt] = useState('')
   const [aiState, setAiState] = useState('idle') // idle | thinking | done | error
@@ -60,6 +67,42 @@ export default function Editor() {
   const selected = useMemo(() => clips.find((c) => c.id === selectedId) || null, [clips, selectedId])
 
   const transcriptsMap = useMemo(() => new Map(Object.entries(transcripts)), [transcripts])
+
+  // Source-time caption cues per clip, straight from word timings.
+  const captionCuesByClip = useMemo(() => {
+    const out = {}
+    for (const [cid, tr] of Object.entries(transcripts)) {
+      if (!tr || tr.error || !tr.words?.length) continue
+      const cues = buildCaptions(tr, {})
+      if (cues.length) out[cid] = cues
+    }
+    return out
+  }, [transcripts])
+
+  const captionStyle = useMemo(
+    () => ({
+      size: captionSize,
+      position: captionPos,
+      background: captionBg,
+      sizeScale: captionSize === 'S' ? 0.035 : captionSize === 'L' ? 0.058 : 0.045,
+      marginScale: 0.08,
+    }),
+    [captionSize, captionPos, captionBg],
+  )
+
+  const hasCaptions = Object.keys(captionCuesByClip).length > 0
+
+  // Burn-in works on both engines: the GPU compositor draws captions on canvas,
+  // and the FFmpeg core does ship libass (it just needs a font handed to it).
+  // Kept as a hook in case a future engine genuinely cannot burn in.
+  const burnInUnavailable = false
+
+  // Caption cue active at the current preview time (selected clip, source time).
+  const previewCue = useMemo(() => {
+    const cues = selected && captionCuesByClip[selected.id]
+    if (!cues) return null
+    return cues.find((c) => currentTime >= c.start && currentTime < c.end) || null
+  }, [selected, captionCuesByClip, currentTime])
 
   // Time ranges of struck sentences — dropped at render time like fillers.
   const excludeRanges = useMemo(() => {
@@ -400,7 +443,14 @@ export default function Editor() {
       const out = await render(
         clips,
         effectivePlan,
-        { resolution, onDiag: diagnostics ? diagLog : undefined },
+        {
+          resolution,
+          onDiag: diagnostics ? diagLog : undefined,
+          captions:
+            burnCaptions && hasCaptions && !burnInUnavailable
+              ? { cuesByClip: captionCuesByClip, style: captionStyle }
+              : undefined,
+        },
         (p) => setProgress(p),
       )
       setResult(out)
@@ -419,7 +469,44 @@ export default function Editor() {
     } finally {
       setRendering(false)
     }
-  }, [rendering, clips, plan, resolution, applyTextEdits, diagnostics, diagLog])
+  }, [
+    rendering,
+    clips,
+    plan,
+    resolution,
+    applyTextEdits,
+    diagnostics,
+    diagLog,
+    burnCaptions,
+    hasCaptions,
+    burnInUnavailable,
+    captionCuesByClip,
+    captionStyle,
+  ])
+
+  // Download captions matching the finished render (or the selected clip's raw
+  // timing when there's no plan yet).
+  const downloadCaptions = useCallback(
+    (fmt) => {
+      let cues = []
+      if (plan) {
+        const split = applyCutRanges(applyTextEdits({ ...plan, segments: plan.segments }))
+        cues = remapToOutputTimeline(captionCuesByClip, split, { transitionDuration: 0.5 })
+      } else if (selected && captionCuesByClip[selected.id]) {
+        cues = captionCuesByClip[selected.id]
+      }
+      if (!cues.length) return
+      const text = fmt === 'vtt' ? toVTT(cues) : toSRT(cues)
+      const blob = new Blob([text], { type: fmt === 'vtt' ? 'text/vtt' : 'application/x-subrip' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${(plan?.title || selected?.name || 'reelmind').replace(/\.\w+$/, '').replace(/\s+/g, '_').toLowerCase()}.${fmt}`
+      a.click()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    },
+    [plan, applyTextEdits, captionCuesByClip, selected],
+  )
 
   const doSmokeTest = useCallback(async () => {
     if (smoke?.running) return
@@ -829,6 +916,83 @@ export default function Editor() {
                     {retakeGroupCount > 0 && ' Pick one take per retake group; the rest are excluded.'}
                     {plan && ' Accented lines are in the current plan.'}
                   </p>
+
+                  <div className="ed-caps">
+                    <div className="ed-caps-head">
+                      <label className={`ed-toggle${burnInUnavailable ? ' is-disabled' : ''}`}>
+                        <input
+                          type="checkbox"
+                          checked={burnCaptions && !burnInUnavailable}
+                          disabled={burnInUnavailable}
+                          onChange={(e) => setBurnCaptions(e.target.checked)}
+                        />
+                        <span>Burn captions into video</span>
+                      </label>
+                      {burnCaptions && !burnInUnavailable && (
+                        <p className="ed-caps-note is-info">
+                          On the software renderer this fetches a caption font (~700KB, once per
+                          session). If that fails the video still renders — just without burned-in
+                          captions — and the .srt / .vtt below are unaffected.
+                        </p>
+                      )}
+                    </div>
+
+                    <div className="ed-caps-row">
+                      <span className="ed-dim">Size</span>
+                      {['S', 'M', 'L'].map((s) => (
+                        <button
+                          key={s}
+                          className={`ed-seg-btn${captionSize === s ? ' is-on' : ''}`}
+                          onClick={() => setCaptionSize(s)}
+                        >
+                          {s}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="ed-caps-row">
+                      <span className="ed-dim">Position</span>
+                      {['bottom', 'top'].map((p) => (
+                        <button
+                          key={p}
+                          className={`ed-seg-btn${captionPos === p ? ' is-on' : ''}`}
+                          onClick={() => setCaptionPos(p)}
+                        >
+                          {p}
+                        </button>
+                      ))}
+                    </div>
+                    <label className="ed-toggle ed-caps-row">
+                      <input
+                        type="checkbox"
+                        checked={captionBg}
+                        onChange={(e) => setCaptionBg(e.target.checked)}
+                      />
+                      <span>Background box</span>
+                    </label>
+
+                    <div className={`ed-caps-preview pos-${captionPos}${captionBg ? ' has-bg' : ''}`}>
+                      <span
+                        className={`ed-caps-preview-text sz-${captionSize}`}
+                        data-text="The quick brown fox"
+                      >
+                        The quick brown fox
+                      </span>
+                    </div>
+
+                    <div className="ed-caps-dl">
+                      <button className="ed-btn ed-btn-sm" onClick={() => downloadCaptions('srt')}>
+                        Download .srt
+                      </button>
+                      <button className="ed-btn ed-btn-sm" onClick={() => downloadCaptions('vtt')}>
+                        Download .vtt
+                      </button>
+                    </div>
+                    <p className="ed-dim">
+                      {hasCaptions
+                        ? `${Object.values(captionCuesByClip).reduce((a, c) => a + c.length, 0)} cues from ${Object.keys(captionCuesByClip).length} transcript${Object.keys(captionCuesByClip).length === 1 ? '' : 's'}.`
+                        : 'Transcribe a clip to generate captions.'}
+                    </p>
+                  </div>
                 </>
               )}
             </div>
@@ -880,6 +1044,17 @@ export default function Editor() {
                   onPlay={() => setPlaying(true)}
                   playsInline
                 />
+                {previewCue && (burnCaptions || leftTab === 'transcript') && (
+                  <div
+                    className={`ed-cap-overlay pos-${captionPos} sz-${captionSize}${captionBg ? ' has-bg' : ''}`}
+                  >
+                    {previewCue.lines.map((ln, i) => (
+                      <div key={i} className="ed-cap-line">
+                        {ln}
+                      </div>
+                    ))}
+                  </div>
+                )}
                 <div className="ed-preview-bar">
                   <button className="ed-play" onClick={togglePlay}>
                     {playing ? '❚❚' : '▶'}
@@ -1115,6 +1290,12 @@ export default function Editor() {
                     plan || { segments: clips.map((c) => ({ start: 0, end: c.duration })) },
                     { resolution, method: engine?.supported ? 'webcodecs' : 'ffmpeg' },
                   )}s estimated.
+                  {' · Captions: '}
+                  {!hasCaptions
+                    ? 'no transcript'
+                    : burnCaptions
+                      ? `burned (${captionSize}, ${captionPos}${captionBg ? ', box' : ''})`
+                      : 'off (SRT/VTT available)'}
                 </p>
               )}
 
@@ -1142,6 +1323,9 @@ export default function Editor() {
                       {result.internalCuts > 0
                         ? `, ${result.internalCuts} internal cut${result.internalCuts === 1 ? '' : 's'}`
                         : ', no internal cuts'}
+                      {result.captionsBurned
+                        ? `, captions burned (${result.captions?.style?.size || 'M'}, ${result.captions?.style?.position || 'bottom'})`
+                        : ''}
                     </div>
                   )}
                   <div className="ed-dim">
@@ -1153,6 +1337,15 @@ export default function Editor() {
                         result.fallbackReason ? ` — ${result.fallbackReason}` : ''
                       }.`}
                   </div>
+
+                  {/* Burn-in was asked for but the renderer could not deliver it. */}
+                  {result.captions && !result.captionsBurned && (
+                    <div className="ed-warn">
+                      Captions could not be burned in on the software renderer. The video rendered
+                      without them; the .srt file is still available.
+                      {result.captionsSkippedReason ? ` — ${result.captionsSkippedReason}` : ''}
+                    </div>
+                  )}
 
                   {verifyState && (
                     <div className="ed-verify">
@@ -1381,6 +1574,39 @@ const CSS = `
 
 .ed-toggle { display: flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--muted); cursor: pointer; }
 .ed-toggle input { accent-color: var(--purple); }
+
+/* captions */
+.ed-caps { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 9px; }
+.ed-caps-head { font-weight: 600; }
+.ed-caps-note { margin: 5px 0 0; font-size: 10.5px; line-height: 1.5; color: #ffcf8a; }
+.ed-caps-note.is-info { color: var(--muted); }
+.ed-toggle.is-disabled { opacity: .55; cursor: not-allowed; }
+.ed-toggle.is-disabled input { cursor: not-allowed; }
+.ed-warn { font-size: 11px; line-height: 1.5; color: #ffcf8a; background: rgba(255,190,90,.09); border: 1px solid rgba(255,190,90,.35); border-radius: 8px; padding: 8px 10px; }
+.ed-caps-row { display: flex; align-items: center; gap: 6px; }
+.ed-caps-row > .ed-dim { width: 58px; flex: none; }
+.ed-seg-btn { border: 1px solid var(--border); background: var(--surface); color: var(--muted); border-radius: 7px; padding: 4px 10px; font-size: 11px; font-weight: 600; text-transform: capitalize; }
+.ed-seg-btn.is-on { border-color: var(--cyan); color: var(--cyan); }
+.ed-caps-preview { position: relative; height: 74px; border-radius: 8px; background: linear-gradient(120deg, #1a1a28, #0f0f1b); border: 1px solid var(--border); display: flex; justify-content: center; overflow: hidden; }
+.ed-caps-preview.pos-bottom { align-items: flex-end; padding-bottom: 8px; }
+.ed-caps-preview.pos-top { align-items: flex-start; padding-top: 8px; }
+.ed-caps-preview-text { font-family: 'DM Sans', sans-serif; font-weight: 700; color: #fff; text-align: center; -webkit-text-stroke: 3px #000; paint-order: stroke fill; }
+.ed-caps-preview-text.sz-S { font-size: 12px; }
+.ed-caps-preview-text.sz-M { font-size: 15px; }
+.ed-caps-preview-text.sz-L { font-size: 19px; }
+.ed-caps-preview.has-bg .ed-caps-preview-text { background: rgba(0,0,0,.55); padding: 2px 8px; border-radius: 5px; -webkit-text-stroke: 0; }
+.ed-caps-dl { display: flex; gap: 8px; }
+
+/* live caption overlay on the center preview */
+.ed-cap-overlay { position: absolute; left: 0; right: 0; display: flex; flex-direction: column; align-items: center; gap: 2px; pointer-events: none; padding: 0 6%; text-align: center; z-index: 3; }
+.ed-cap-overlay.pos-bottom { bottom: 8%; }
+.ed-cap-overlay.pos-top { top: 8%; }
+.ed-cap-line { font-family: 'DM Sans', sans-serif; font-weight: 700; color: #fff; -webkit-text-stroke: 3px #000; paint-order: stroke fill; line-height: 1.25; }
+.ed-cap-overlay.sz-S .ed-cap-line { font-size: clamp(11px, 3.2vh, 22px); }
+.ed-cap-overlay.sz-M .ed-cap-line { font-size: clamp(13px, 4.2vh, 30px); }
+.ed-cap-overlay.sz-L .ed-cap-line { font-size: clamp(16px, 5.4vh, 40px); }
+.ed-cap-overlay.has-bg { background: none; }
+.ed-cap-overlay.has-bg .ed-cap-line { background: rgba(0,0,0,.55); padding: 1px 10px; border-radius: 5px; -webkit-text-stroke: 0; }
 
 .ed-smoke { margin-top: 10px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); background: #05050e; font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; line-height: 1.5; color: var(--muted); max-height: 220px; overflow-y: auto; white-space: pre-wrap; }
 .ed-smoke.is-ok { border-color: rgba(9,246,255,.4); }

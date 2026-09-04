@@ -4,6 +4,7 @@ import { FFmpeg } from '@ffmpeg/ffmpeg'
 import { fetchFile, toBlobURL } from '@ffmpeg/util'
 import { checkWebCodecsSupport } from './webcodecs/support.js'
 import { renderWithWebCodecs } from './webcodecs/renderer.js'
+import { remapToOutputTimeline, toSRT } from './captions.js'
 
 // The ESM core, not the UMD one: @ffmpeg/ffmpeg 0.12 always spawns a
 // `type: "module"` worker, where `importScripts` doesn't exist, so its loader
@@ -54,6 +55,36 @@ export async function loadEngine(onProgress = () => {}) {
     return await _loading
   } finally {
     _loading = null
+  }
+}
+
+// @ffmpeg/core@0.12.6 DOES ship libass (its logs report FriBidi + HarfBuzz), but
+// it has no fontconfig and the wasm FS is empty, so the subtitles filter loads
+// and then draws nothing: "can't find selected font provider". Handing libass a
+// font directory via `fontsdir=` is what makes burn-in actually work. DejaVu is
+// the conventional libass fallback face and has broad glyph coverage.
+const CAPTION_FONT_URL = 'https://cdn.jsdelivr.net/npm/dejavu-fonts-ttf@2.37.3/ttf/DejaVuSans-Bold.ttf'
+const CAPTION_FONT_DIR = '/fonts'
+const CAPTION_FONT_FILE = `${CAPTION_FONT_DIR}/DejaVuSans-Bold.ttf`
+const CAPTION_FONT_NAME = 'DejaVu Sans Bold'
+let _captionFont = null
+
+/** Install the caption face into the FFmpeg FS once per engine instance. */
+async function ensureCaptionFont(ffmpeg) {
+  if (_captionFont) return _captionFont
+  _captionFont = (async () => {
+    const res = await fetch(CAPTION_FONT_URL)
+    if (!res.ok) throw new Error(`caption font fetch failed (${res.status})`)
+    const bytes = new Uint8Array(await res.arrayBuffer())
+    await ffmpeg.createDir(CAPTION_FONT_DIR).catch(() => {})
+    await ffmpeg.writeFile(CAPTION_FONT_FILE, bytes)
+    return true
+  })()
+  try {
+    return await _captionFont
+  } catch (err) {
+    _captionFont = null // let the next render retry the fetch
+    throw err
   }
 }
 
@@ -304,16 +335,85 @@ export async function renderVideo(clips, plan, opts = {}, onProgress = () => {})
     const list = partFiles.map((p) => `file '${p}'`).join('\n') + '\n'
     await ffmpeg.writeFile('list.txt', new TextEncoder().encode(list))
 
-    await ffmpeg.exec([
-      '-f', 'concat', '-safe', '0', '-i', 'list.txt',
-      '-c', 'copy',
-      'output.mp4',
-    ])
+    const srt = opts.captions?.srt
+    let captionsBurned = false
+    let captionsSkippedReason = null
+
+    if (srt) {
+      // Burn captions with libass. Timeline is already remapped to the concat
+      // output, so no offset needed. Re-encode video (can't filter a -c copy).
+      const st = opts.captions.style || {}
+      const fontSize = st.size === 'S' ? 18 : st.size === 'L' ? 32 : 24
+      const alignment = st.position === 'top' ? 6 : 2 // libass numpad anchors
+      const marginV = Math.round((st.marginScale ?? 0.08) * 720)
+
+      let fontOk = true
+      try {
+        await ensureCaptionFont(ffmpeg)
+      } catch (err) {
+        fontOk = false
+        captionsSkippedReason = `Could not load the caption font (${err?.message || err}).`
+      }
+
+      if (fontOk) {
+        await ffmpeg.writeFile('captions.srt', new TextEncoder().encode(srt))
+        const style = `FontName=${CAPTION_FONT_NAME},FontSize=${fontSize},PrimaryColour=&Hffffff,OutlineColour=&H000000,Outline=2,Alignment=${alignment},MarginV=${marginV}`
+
+        // exec() returns 0 even when the filter silently drew nothing, so the
+        // log is the only truthful signal. libass emits `fontselect:` only once
+        // it has actually resolved a face to draw with.
+        const logged = []
+        const tap = ({ message }) => logged.push(message)
+        ffmpeg.on('log', tap)
+        let code
+        try {
+          code = await ffmpeg.exec([
+            '-f', 'concat', '-safe', '0', '-i', 'list.txt',
+            '-vf', `subtitles=captions.srt:fontsdir=${CAPTION_FONT_DIR}:force_style='${style}'`,
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-pix_fmt', 'yuv420p',
+            '-c:a', 'copy',
+            'output.mp4',
+          ])
+        } catch {
+          code = 1
+        } finally {
+          ffmpeg.off('log', tap)
+        }
+
+        const log = logged.join('\n')
+        const hardFailure = /No such filter|Unable to parse|Error initializing|Error opening filters/i.test(log)
+        const drewText = /fontselect:/i.test(log)
+        if (code === 0 && !hardFailure && drewText) {
+          captionsBurned = true
+        } else {
+          captionsSkippedReason = hardFailure
+            ? 'The subtitles filter failed to initialise in this FFmpeg build.'
+            : 'libass loaded but could not resolve a font face to draw with.'
+        }
+      }
+
+      if (!captionsBurned) {
+        console.warn(`[renderVideo] ${captionsSkippedReason} Rendering without burned-in captions.`)
+        await ffmpeg.deleteFile('output.mp4').catch(() => {})
+        await ffmpeg.exec(['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', 'output.mp4'])
+      }
+    } else {
+      await ffmpeg.exec([
+        '-f', 'concat', '-safe', '0', '-i', 'list.txt',
+        '-c', 'copy',
+        'output.mp4',
+      ])
+    }
 
     const data = await ffmpeg.readFile('output.mp4')
     const blob = new Blob([data.buffer], { type: 'video/mp4' })
     onProgress({ stage: 'done', pct: 100, msg: 'Render complete.' })
-    return { url: URL.createObjectURL(blob), size: blob.size }
+    return {
+      url: URL.createObjectURL(blob),
+      size: blob.size,
+      captionsBurned,
+      ...(captionsSkippedReason ? { captionsSkippedReason } : {}),
+    }
   } finally {
     ffmpeg.off('progress', onExec)
     // Free everything — browser memory is capped ~2-4GB and leaks crash the tab.
@@ -327,6 +427,7 @@ export async function renderVideo(clips, plan, opts = {}, onProgress = () => {})
     for (const name of sourceName.values()) await kill(name)
     for (const p of partFiles) await kill(p)
     await kill('list.txt')
+    await kill('captions.srt')
     await kill('output.mp4')
   }
 }
@@ -336,7 +437,7 @@ export async function renderVideo(clips, plan, opts = {}, onProgress = () => {})
  * a renderer that has no cut logic of its own (the WebCodecs path) still drops
  * them. The FFmpeg path does its own splitting, so it keeps the original plan.
  */
-function applyCutRanges(plan) {
+export function applyCutRanges(plan) {
   const raw = [...(plan.fillerRanges || []), ...(plan.excludeRanges || [])]
   if (!raw.length) return plan
   const cuts = coalesceRanges(raw)
@@ -356,25 +457,64 @@ function applyCutRanges(plan) {
   return next
 }
 
+/** Overlap consumed by one crossfaded boundary, and by a hard cut (none). */
+export const XFADE_DURATION = 0.5
+export const CUT_DURATION = 0
+
+/**
+ * Decide how a given engine will actually JOIN the plan's segments — before
+ * anything is remapped against that timeline. Caption remapping and the
+ * expected-duration calculation both read from here, so they can never disagree
+ * with what the renderer does.
+ *
+ * The two engines genuinely differ:
+ *  - WebCodecs composites crossfades on the canvas, so a non-cut boundary
+ *    overlaps the previous segment and SHORTENS the timeline by XFADE_DURATION.
+ *  - FFmpeg joins pre-normalised parts with the concat demuxer (`-c copy`).
+ *    There is no xfade chain, so every boundary is a hard cut and the timeline
+ *    is the plain sum of segment durations, whatever the plan asked for.
+ *
+ * If an xfade filter chain is ever added to the FFmpeg join, return
+ * `{ path: 'xfade', transitionDuration: XFADE_DURATION }` for it here and both
+ * the caption remap and the duration expectation follow automatically.
+ *
+ * @param {object} plan    the plan as it will be rendered (post applyCutRanges)
+ * @param {'webcodecs'|'ffmpeg'} engine
+ * @returns {{path:'concat'|'xfade', transitionDuration:number}}
+ */
+export function resolveJoinPath(plan, engine) {
+  const segs = plan?.segments || []
+  const anyTransition = segs.some((s, i) => i > 0 && s.transition && s.transition !== 'cut')
+  if (engine === 'ffmpeg' || !anyTransition) {
+    return { path: 'concat', transitionDuration: CUT_DURATION }
+  }
+  return { path: 'xfade', transitionDuration: XFADE_DURATION }
+}
+
 /**
  * How many shots (plan segments) and how many extra internal splices the cut
  * ranges introduce. `internalCuts` is the number of within-shot joins created by
  * filler / struck / retake removal — for the "Rendered N shots, M internal cuts"
  * readout.
+ *
+ * @param {object} plan
+ * @param {{transitionDuration?:number}} [opts]  pullback per crossfaded
+ *   boundary. Pass the value from resolveJoinPath() for the engine that will
+ *   render, or totalDuration will describe a video nobody is going to produce.
  */
-export function countCuts(plan) {
+export function countCuts(plan, opts = {}) {
   const shots = plan?.segments?.length || 0
   const split = applyCutRanges(plan)
   const segs = split.segments || []
   const units = segs.length
 
-  // Rendered timeline length, mirroring the WebCodecs placement math (a non-cut
-  // transition overlaps the previous segment by up to `td`).
-  const td = 0.5
+  const td = opts.transitionDuration ?? XFADE_DURATION
   let totalDuration = 0
   segs.forEach((s, i) => {
     const len = Math.max(0, s.end - s.start)
-    if (i > 0 && s.transition && s.transition !== 'cut') totalDuration -= Math.min(td, len / 2)
+    if (td > 0 && i > 0 && s.transition && s.transition !== 'cut') {
+      totalDuration -= Math.min(td, len / 2)
+    }
     totalDuration += len
   })
 
@@ -394,22 +534,72 @@ export function countCuts(plan) {
  *     that failure is the signal a test is looking for.
  *   - forceFFmpeg: legacy alias for forceEngine: 'ffmpeg'
  *   - onDiag: per-segment diagnostics callback
- * @returns {Promise<{url,size,method:'webcodecs'|'ffmpeg',fellBack:boolean,fallbackReason?:string,reason?:string}>}
+ *   - captions: { cuesByClip, style } — source-time cues, remapped per engine
+ * @returns {Promise<{url,size,method:'webcodecs'|'ffmpeg',joinPath:'concat'|'xfade',
+ *   captionsBurned:boolean,captionsSkippedReason?:string,fellBack:boolean,
+ *   fallbackReason?:string,reason?:string}>}
  */
 export async function render(clips, plan, opts = {}, onProgress = () => {}) {
   const forceEngine = opts.forceEngine || (opts.forceFFmpeg ? 'ffmpeg' : null)
 
   const { w, h } = RES[opts.resolution] || RES['720p']
-  const stats = { ...countCuts(plan), width: w, height: h }
+  const captionsOn = !!opts.captions?.cuesByClip && Object.keys(opts.captions.cuesByClip).length > 0
+  const capStyle = opts.captions?.style || {}
+
+  // Source-time cues → the finished output timeline. Remap against the SAME
+  // split plan each engine renders, so captions land on the right frames.
+  const splitPlan = applyCutRanges(plan)
+
+  // Resolve the join path per engine FIRST — the same number then drives both
+  // the caption remap and the expected duration, so they cannot disagree with
+  // what actually renders.
+  const joinFor = {
+    webcodecs: resolveJoinPath(splitPlan, 'webcodecs'),
+    ffmpeg: resolveJoinPath(splitPlan, 'ffmpeg'),
+  }
+  const statsFor = (engine) => ({
+    ...countCuts(plan, { transitionDuration: joinFor[engine].transitionDuration }),
+    width: w,
+    height: h,
+    joinPath: joinFor[engine].path,
+    captions: captionsOn ? { style: capStyle } : null,
+  })
+  const capFor = (engine) =>
+    captionsOn
+      ? remapToOutputTimeline(opts.captions.cuesByClip, splitPlan, {
+          transitionDuration: joinFor[engine].transitionDuration,
+        })
+      : null
 
   const runWebCodecs = async () => {
     onProgress({ stage: 'webcodecs', pct: 0, msg: 'Starting GPU render…' })
-    const out = await renderWithWebCodecs(clips, applyCutRanges(plan), opts, onProgress)
-    return { ...out, ...stats, method: 'webcodecs', fellBack: false }
+    const cues = capFor('webcodecs')
+    const wcOpts = cues ? { ...opts, captions: { cues, style: capStyle } } : opts
+    const out = await renderWithWebCodecs(clips, splitPlan, wcOpts, onProgress)
+    return {
+      ...out,
+      ...statsFor('webcodecs'),
+      method: 'webcodecs',
+      fellBack: false,
+      // The canvas compositor draws captions itself — always delivered.
+      captionsBurned: !!cues,
+    }
   }
   const runFFmpeg = async (extra) => {
-    const out = await renderVideo(clips, plan, opts, onProgress)
-    return { ...out, ...stats, method: 'ffmpeg', fellBack: false, ...extra }
+    const cues = capFor('ffmpeg')
+    const fOpts = cues ? { ...opts, captions: { srt: toSRT(cues), style: capStyle } } : opts
+    const out = await renderVideo(clips, plan, fOpts, onProgress)
+    return {
+      ...out,
+      ...statsFor('ffmpeg'),
+      method: 'ffmpeg',
+      fellBack: false,
+      captionsBurned: cues ? !!out.captionsBurned : false,
+      ...(cues && !out.captionsBurned
+        ? { captionsSkippedReason: out.captionsSkippedReason || 'The software renderer could not burn in captions.' }
+        : {}),
+      ...extra,
+    }
   }
 
   // --- forced engine: do exactly that, report failure verbatim ---------
@@ -428,8 +618,11 @@ export async function render(clips, plan, opts = {}, onProgress = () => {}) {
         pct: 0,
         msg: `GPU render failed (${err?.message || err}). Retrying with FFmpeg…`,
       })
-      const out = await renderVideo(clips, plan, opts, onProgress)
-      return { ...out, ...stats, method: 'ffmpeg', fellBack: true, fallbackReason: err?.message || String(err) }
+      return {
+        ...(await runFFmpeg()),
+        fellBack: true,
+        fallbackReason: err?.message || String(err),
+      }
     }
   }
 

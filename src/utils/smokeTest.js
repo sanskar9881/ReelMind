@@ -8,7 +8,8 @@
 import { probeAll } from './videoMeta.js'
 import { analyzeAll } from './analyzer.js'
 import { generateEditPlan } from './ai.js'
-import { render } from './videoProcessor.js'
+import { render, applyCutRanges, resolveJoinPath } from './videoProcessor.js'
+import { remapToOutputTimeline } from './captions.js'
 import { verifyRender, measureSync } from './verify.js'
 
 function pickMime() {
@@ -117,6 +118,82 @@ async function runEngine(engine, clips, plan, onDiag, log, opts = {}) {
   }
 }
 
+function loadDuration(url) {
+  return new Promise((resolve, reject) => {
+    const v = document.createElement('video')
+    v.muted = true
+    v.preload = 'metadata'
+    v.src = url
+    v.onloadedmetadata = () => resolve(v.duration)
+    v.onerror = () => reject(new Error('could not load rendered video'))
+  })
+}
+
+/**
+ * Captions must land on the timeline the chosen engine actually produces. The
+ * two engines join differently (WebCodecs crossfades and shortens; FFmpeg
+ * concats and does not), so a plan with fades is the case that catches a remap
+ * pointed at the wrong timeline. Assert the last cue ends with the video.
+ */
+async function captionTimelineCheck(clips, onDiag, log) {
+  const [a, b] = clips
+  const segments = [
+    { clip: a.name, clipId: a.id, start: 0.2, end: 1.8, transition: 'cut', role: 'hook' },
+    { clip: b.name, clipId: b.id, start: 0.2, end: 1.8, transition: 'fade', role: 'body' },
+    { clip: a.name, clipId: a.id, start: 1.9, end: 2.9, transition: 'fade', role: 'outro' },
+  ]
+  const plan = { title: 'fade caption check', reasoning: '', music: 'none', segments }
+
+  // One cue spanning each segment, in that clip's source time.
+  const cuesByClip = {}
+  for (const s of segments) {
+    ;(cuesByClip[s.clipId] ||= []).push({
+      start: s.start,
+      end: s.end,
+      lines: ['caption'],
+      words: [],
+    })
+  }
+  for (const k of Object.keys(cuesByClip)) cuesByClip[k].sort((x, y) => x.start - y.start)
+
+  const split = applyCutRanges(plan)
+  const out = {}
+  for (const engine of ['webcodecs', 'ffmpeg']) {
+    try {
+      const join = resolveJoinPath(split, engine)
+      const cues = remapToOutputTimeline(cuesByClip, split, {
+        transitionDuration: join.transitionDuration,
+      })
+      const lastCueEnd = cues.length ? cues[cues.length - 1].end : NaN
+
+      const r = await render(
+        clips,
+        plan,
+        {
+          resolution: '720p',
+          forceEngine: engine,
+          onDiag,
+          captions: { cuesByClip, style: { size: 'M', position: 'bottom' } },
+        },
+        () => {},
+      )
+      const duration = await loadDuration(r.url)
+      URL.revokeObjectURL(r.url)
+
+      const deltaMs = Math.round(Math.abs(duration - lastCueEnd) * 1000)
+      const ok = deltaMs <= 150
+      log(
+        `  ${ok ? '✓' : '✗'} ${engine} (${join.path}): last cue ends ${lastCueEnd.toFixed(3)}s, video ${duration.toFixed(3)}s → Δ ${deltaMs}ms${ok ? '' : '  ← >150ms'}`,
+      )
+      out[engine] = { ok, deltaMs, lastCueEnd, duration, joinPath: join.path, captionsBurned: r.captionsBurned }
+    } catch (err) {
+      log(`  ✗ ${engine}: ${err?.message || err}`)
+      out[engine] = { ok: false, error: err?.message || String(err) }
+    }
+  }
+  return out
+}
+
 /**
  * @param {(line:string)=>void} log
  * @param {(d:object)=>void} [onDiag]
@@ -166,6 +243,10 @@ export async function runSmokeTest(log = () => {}, onDiag) {
   const cutPlan = { ...plan, segments: plan.segments.map((s) => ({ ...s, transition: 'cut' })) }
   results['webcodecs-cut'] = await runEngine('webcodecs', clips, cutPlan, onDiag, log)
 
+  log('── caption timeline (3 segments, fade transitions) ──')
+  const capCheck = await captionTimelineCheck(clips, onDiag, log)
+  results.captionTimeline = capCheck
+
   clips.forEach((c) => URL.revokeObjectURL(c.url))
 
   log('── summary ──')
@@ -185,7 +266,9 @@ export async function runSmokeTest(log = () => {}, onDiag) {
 
   // FFmpeg must pass. WebCodecs must pass only if the recording was actually MP4
   // (otherwise there is nothing for mp4box to demux — not a real failure).
-  const overallOk = !!results.ffmpeg?.ok && (isMp4 ? !!results.webcodecs?.ok : true)
+  const capOk = !!capCheck.ffmpeg?.ok && (isMp4 ? !!capCheck.webcodecs?.ok : true)
+  const overallOk =
+    !!results.ffmpeg?.ok && (isMp4 ? !!results.webcodecs?.ok : true) && capOk
   log(overallOk ? '✅ SMOKE TEST PASSED' : '❌ SMOKE TEST FAILED')
 
   return { ok: overallOk, results, mime, isMp4 }

@@ -50,6 +50,74 @@ function letterbox(fw, fh, W, H) {
   return { dw, dh, dx: Math.floor((W - dw) / 2), dy: Math.floor((H - dh) / 2) }
 }
 
+// ---- captions ---------------------------------------------------------
+
+// Cues are sorted by start; find the one covering `t` in O(log n) — at 30fps
+// over ten minutes a linear scan is 18,000 array walks per render.
+function findActiveCue(cues, t) {
+  let lo = 0
+  let hi = cues.length - 1
+  let ans = -1
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1
+    if (cues[mid].start <= t) {
+      ans = mid
+      lo = mid + 1
+    } else {
+      hi = mid - 1
+    }
+  }
+  return ans >= 0 && t < cues[ans].end ? cues[ans] : null
+}
+
+function drawCaption(ctx, W, H, cue, style = {}) {
+  const lines = (cue.lines || []).slice(0, 2)
+  if (!lines.length) return
+
+  const fontPx = Math.max(12, Math.round(H * (style.sizeScale ?? 0.045)))
+  const lineH = Math.round(fontPx * 1.28)
+  const marginV = Math.round(H * (style.marginScale ?? 0.08))
+  const family = style.fontFamily || "'DM Sans', system-ui, -apple-system, sans-serif"
+
+  ctx.save()
+  ctx.font = `700 ${fontPx}px ${family}`
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'alphabetic'
+  ctx.lineJoin = 'round'
+  ctx.miterLimit = 2
+
+  // baseline of the LAST (bottom) line
+  const lastBaseline =
+    style.position === 'top' ? marginV + fontPx + (lines.length - 1) * lineH : H - marginV
+  const topBaseline = lastBaseline - (lines.length - 1) * lineH
+
+  if (style.background) {
+    let maxW = 0
+    for (const ln of lines) maxW = Math.max(maxW, ctx.measureText(ln).width)
+    const padX = Math.round(fontPx * 0.55)
+    const padY = Math.round(fontPx * 0.4)
+    const boxW = Math.min(W - 8, maxW + padX * 2)
+    const boxH = (lines.length - 1) * lineH + fontPx + padY * 2
+    const boxX = Math.round((W - boxW) / 2)
+    const boxY = Math.round(topBaseline - fontPx - padY + fontPx * 0.15)
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'
+    ctx.beginPath()
+    if (ctx.roundRect) ctx.roundRect(boxX, boxY, boxW, boxH, Math.round(fontPx * 0.28))
+    else ctx.rect(boxX, boxY, boxW, boxH)
+    ctx.fill()
+  }
+
+  ctx.lineWidth = Math.max(3, Math.round(fontPx * 0.12)) // ~3px stroke for legibility
+  ctx.strokeStyle = '#000'
+  ctx.fillStyle = '#fff'
+  lines.forEach((ln, i) => {
+    const y = lastBaseline - (lines.length - 1 - i) * lineH
+    ctx.strokeText(ln, W / 2, y) // stroke first, fill over
+    ctx.fillText(ln, W / 2, y)
+  })
+  ctx.restore()
+}
+
 // ---- audio -------------------------------------------------------------
 
 const RATE = 44100
@@ -290,6 +358,17 @@ export async function renderWithWebCodecs(clips, plan, opts = {}, onProgress = (
   const tdFramesBase = Math.round(transitionSec * FPS)
   const onDiag = typeof opts.onDiag === 'function' ? opts.onDiag : null
 
+  // Output-timeline caption cues to burn into the canvas (already remapped).
+  const capCues = (opts.captions?.cues || []).slice().sort((a, b) => a.start - b.start)
+  const capStyle = opts.captions?.style || {}
+  if (capCues.length && typeof document !== 'undefined' && document.fonts?.ready) {
+    try {
+      await document.fonts.ready
+    } catch {
+      /* fonts optional */
+    }
+  }
+
   // Nominal output-timeline length (seconds), accounting for transition overlap.
   let cursor = 0
   for (let i = 0; i < segs.length; i++) {
@@ -309,6 +388,11 @@ export async function renderWithWebCodecs(clips, plan, opts = {}, onProgress = (
     fastStart: 'in-memory',
     firstTimestampBehavior: 'offset',
   })
+  // NOTE: the muxed container reports ~85ms longer than the exact track lengths
+  // (video and audio each land dead-on the plan — see the "[renderer] timeline"
+  // debug line). That is AAC encoder priming/padding surfaced in the MP4 track
+  // duration; it shifts both tracks equally so A/V sync is unaffected, and it is
+  // well within verifyRender's tolerance. Deliberately not chased.
 
   const canvas = new OffscreenCanvas(W, H)
   const ctx = canvas.getContext('2d', { alpha: false })
@@ -442,6 +526,12 @@ export async function renderWithWebCodecs(clips, plan, opts = {}, onProgress = (
           // here; the incoming segment encodes the blended result at this slot.
           newTail.push(await createImageBitmap(canvas))
         } else {
+          // Burn the active caption over the composed frame, before it becomes a
+          // VideoFrame. `outIdx / FPS` is the timestamp this frame will carry.
+          if (capCues.length) {
+            const cue = findActiveCue(capCues, outIdx / FPS)
+            if (cue) drawCaption(ctx, W, H, cue, capStyle)
+          }
           const outFrame = frames.track(
             new VideoFrame(canvas, {
               timestamp: Math.round(outIdx * FRAME_US),
