@@ -9,10 +9,16 @@ Browser-based AI vlog editor. Vite + React. No backend yet.
 - src/utils/transcribe.js — main-thread wrapper: 16kHz mono audio extraction + words/sentences/fillers
 - src/utils/retakes.js — literal-retake detection via weighted token-overlap (no model); findRetakes / pickBestTake. withTranscript() attaches analysis.retakes
 - src/utils/ai.js         — edit planner. USE_MOCK = true, no API key spend yet
-- src/utils/videoProcessor.js — render(): WebCodecs (GPU) path with FFmpeg.wasm fallback; renderVideo() is the FFmpeg two-pass; estimateRenderSeconds()
+- src/utils/videoProcessor.js — render(): WebCodecs (GPU) path with FFmpeg.wasm fallback; renderVideo() is the FFmpeg two-pass; estimateRenderSeconds(); coalesceRanges() + countCuts()
+- src/utils/audioSplice.js — cut hygiene: SPLICE_MS, applyEdgeFades (equal-power), concatWithSplice, findZeroCrossing. For butt-joined audio, NOT crossfades
 - src/utils/webcodecs/support.js — capability gate (VideoEncoder/AudioEncoder isConfigSupported)
-- src/utils/webcodecs/demuxer.js — mp4box.js wrapper; returns samples with MICROSECOND timestamps + avcC description
-- src/utils/webcodecs/renderer.js — decode → canvas composite (transitions) → encode → mp4-muxer. Close EVERY VideoFrame immediately; queue backpressure
+- src/utils/webcodecs/demuxer.js — mp4box.js wrapper; returns samples with MICROSECOND timestamps + avcC description. Arms extraction (setExtractionOptions+start) INSIDE onReady — a fragmented MP4 (MediaRecorder, some phones) carries moov+all moof in one appendBuffer
+- FFmpeg core is the ESM build (dist/esm), not UMD: @ffmpeg/ffmpeg 0.12 always spawns a type:module worker where importScripts is absent, so it needs a real ES module with a default export
+- src/utils/webcodecs/renderer.js — decode → canvas composite (transitions) → encode → mp4-muxer. Close EVERY VideoFrame immediately; queue backpressure; frame tracker asserts drained per segment
+- src/utils/memoryGuard.js — createFrameTracker(): track/release/openCount/peak/assertDrained. Leak = throw naming the segment, not a dead tab
+- src/utils/verify.js — verifyRender(blobUrl, {totalDuration,width,height}) + measureSync(). Post-render harness: duration, resolution, seekable, non-uniform frame, audio present/non-silent
+- src/utils/smokeTest.js — dev-only runSmokeTest(): canvas+MediaRecorder test clips → full pipeline → verifyRender, run once per forced engine. Reports the container MediaRecorder actually produced (WebM ⇒ WebCodecs untestable, mp4box can't demux it)
+- render() opts.forceEngine ('webcodecs'|'ffmpeg') bypasses the capability check; a forced 'webcodecs' failure is THROWN, not silently fallen back
 
 ## Rules
 - Never use dangerouslyAllowBrowser. Real Claude calls go through /api/plan
@@ -24,5 +30,8 @@ Browser-based AI vlog editor. Vite + React. No backend yet.
 - Transcription is opt-in per clip (Transcribe / Transcribe all). Never auto-transcribe on upload
 - Fillers are surfaced, never auto-removed — the user approves via "Remove all fillers" or the prompt
 - Retake detection is non-destructive — nothing is deleted, non-chosen takes are excluded as time ranges the user can re-include
+- Every internal cut needs splice hygiene: coalesce exclude ranges (<0.12s gap), merge sub-0.25s survivors, snap audio to zero crossings, equal-power edge-fade. Splices are butt-joins; transitions are overlaps — keep both code paths
+- A/V SYNC: audio slice length per segment MUST equal round(round(segDur*FPS)/FPS*RATE) samples — snap the in-point to a zero crossing for the click, then force the length back. Never let the zero-crossing snap change segment length (it accumulates). FFmpeg path uses `-t <dur>` on the output, not `-shortest`
+- Every render is auto-verified (verifyRender + measureSync). A "real render confirmed correct" bar, not "looks done"
 - Palette: bg #05050A, panels #0B0B14, cyan #09F6FF, purple #9B5DFF, muted #6464A0
 - Fonts: Syne (headings), DM Sans (body)

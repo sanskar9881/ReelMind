@@ -5,7 +5,12 @@ import { fetchFile, toBlobURL } from '@ffmpeg/util'
 import { checkWebCodecsSupport } from './webcodecs/support.js'
 import { renderWithWebCodecs } from './webcodecs/renderer.js'
 
-const CORE_BASE = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd'
+// The ESM core, not the UMD one: @ffmpeg/ffmpeg 0.12 always spawns a
+// `type: "module"` worker, where `importScripts` doesn't exist, so its loader
+// falls through to `import(coreURL)` — which needs a real ES module with a
+// `default` export. The UMD build has neither and fails with
+// "failed to import ffmpeg-core.js".
+const CORE_BASE = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm'
 
 const RES = {
   '720p': { w: 1280, h: 720 },
@@ -234,28 +239,32 @@ export async function renderVideo(clips, plan, opts = {}, onProgress = () => {})
       // concat fails. Try mapping the clip's own audio (padded to video length);
       // if the clip has no audio stream that exec errors, so fall back to a
       // synthesized silent stereo track.
+      //
+      // A/V SYNC: use `-t <dur>` on the OUTPUT (not `-shortest`) so the part is
+      // exactly `dur` seconds. `apad` guarantees the audio reaches `dur` before
+      // `-t` trims it, so audio is never cut BELOW the video length.
+      const dstArg = String(dur)
       const withRealAudio = [
         '-ss', String(seg.start),
         '-i', src,
-        '-t', String(dur),
         '-map', '0:v:0', '-map', '0:a:0',
         '-vf', vf,
         '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-pix_fmt', 'yuv420p',
         '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
-        '-af', af ? `apad,${af}` : 'apad', '-shortest',
+        '-af', af ? `apad,${af}` : 'apad',
+        '-t', dstArg,
         part,
       ]
       const withSilentAudio = [
         '-ss', String(seg.start),
         '-i', src,
         '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
-        '-t', String(dur),
         '-map', '0:v:0', '-map', '1:a:0',
         '-vf', vf,
         '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-pix_fmt', 'yuv420p',
         '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
         ...(af ? ['-af', af] : []),
-        '-shortest',
+        '-t', dstArg,
         part,
       ]
 
@@ -267,12 +276,24 @@ export async function renderVideo(clips, plan, opts = {}, onProgress = () => {})
       } catch {
         code = 1
       }
+      let usedSilent = false
       if (code !== 0) {
         await ffmpeg.deleteFile(part).catch(() => {})
         code = await ffmpeg.exec(withSilentAudio)
+        usedSilent = true
         if (code !== 0) throw new Error(`Failed to normalize segment ${i + 1} ("${clip.name}").`)
       }
       partFiles.push(part)
+
+      opts.onDiag?.({
+        phase: 'ffmpeg-part',
+        index: i,
+        clip: clip.name,
+        srcIn: +seg.start.toFixed(4),
+        srcOut: +seg.end.toFixed(4),
+        partDuration: +dur.toFixed(4),
+        audio: usedSilent ? 'silent (synthesized)' : 'source',
+      })
     }
 
     if (!partFiles.length) throw new Error('No segments could be normalized — check that the source clips are still loaded.')
@@ -344,8 +365,20 @@ function applyCutRanges(plan) {
 export function countCuts(plan) {
   const shots = plan?.segments?.length || 0
   const split = applyCutRanges(plan)
-  const units = split.segments?.length || 0
-  return { shots, internalCuts: Math.max(0, units - shots), units }
+  const segs = split.segments || []
+  const units = segs.length
+
+  // Rendered timeline length, mirroring the WebCodecs placement math (a non-cut
+  // transition overlaps the previous segment by up to `td`).
+  const td = 0.5
+  let totalDuration = 0
+  segs.forEach((s, i) => {
+    const len = Math.max(0, s.end - s.start)
+    if (i > 0 && s.transition && s.transition !== 'cut') totalDuration -= Math.min(td, len / 2)
+    totalDuration += len
+  })
+
+  return { shots, internalCuts: Math.max(0, units - shots), units, totalDuration }
 }
 
 /**
@@ -354,22 +387,41 @@ export function countCuts(plan) {
  * mid-render (it has real cross-browser edge cases) the whole render is retried
  * through FFmpeg rather than failing.
  *
+ * @param {object} opts
+ *   - resolution: '720p' | '1080p'
+ *   - forceEngine: 'webcodecs' | 'ffmpeg' — bypass the capability check. With
+ *     'webcodecs', a failure is REPORTED (thrown), not silently fallen back —
+ *     that failure is the signal a test is looking for.
+ *   - forceFFmpeg: legacy alias for forceEngine: 'ffmpeg'
+ *   - onDiag: per-segment diagnostics callback
  * @returns {Promise<{url,size,method:'webcodecs'|'ffmpeg',fellBack:boolean,fallbackReason?:string,reason?:string}>}
  */
 export async function render(clips, plan, opts = {}, onProgress = () => {}) {
-  const support = opts.forceFFmpeg
-    ? { supported: false, reason: 'Forced software render.' }
-    : await checkWebCodecsSupport()
+  const forceEngine = opts.forceEngine || (opts.forceFFmpeg ? 'ffmpeg' : null)
 
-  const stats = countCuts(plan)
+  const { w, h } = RES[opts.resolution] || RES['720p']
+  const stats = { ...countCuts(plan), width: w, height: h }
 
+  const runWebCodecs = async () => {
+    onProgress({ stage: 'webcodecs', pct: 0, msg: 'Starting GPU render…' })
+    const out = await renderWithWebCodecs(clips, applyCutRanges(plan), opts, onProgress)
+    return { ...out, ...stats, method: 'webcodecs', fellBack: false }
+  }
+  const runFFmpeg = async (extra) => {
+    const out = await renderVideo(clips, plan, opts, onProgress)
+    return { ...out, ...stats, method: 'ffmpeg', fellBack: false, ...extra }
+  }
+
+  // --- forced engine: do exactly that, report failure verbatim ---------
+  if (forceEngine === 'webcodecs') return runWebCodecs()
+  if (forceEngine === 'ffmpeg') return runFFmpeg({ reason: 'Forced software render.' })
+
+  // --- auto: capability check, GPU first, fall back on any error -------
+  const support = await checkWebCodecsSupport()
   if (support.supported) {
     try {
-      onProgress({ stage: 'webcodecs', pct: 0, msg: 'Starting GPU render…' })
-      const out = await renderWithWebCodecs(clips, applyCutRanges(plan), opts, onProgress)
-      return { ...out, ...stats, method: 'webcodecs', fellBack: false }
+      return await runWebCodecs()
     } catch (err) {
-      // WebCodecs failed — log and retry the entire render on FFmpeg.
       console.error('[render] WebCodecs path failed; falling back to FFmpeg:', err)
       onProgress({
         stage: 'fallback',
@@ -381,8 +433,7 @@ export async function render(clips, plan, opts = {}, onProgress = () => {}) {
     }
   }
 
-  const out = await renderVideo(clips, plan, opts, onProgress)
-  return { ...out, ...stats, method: 'ffmpeg', fellBack: false, reason: support.reason }
+  return runFFmpeg({ reason: support.reason })
 }
 
 /**

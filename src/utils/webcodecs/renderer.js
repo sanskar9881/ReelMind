@@ -10,6 +10,7 @@
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer'
 import { demux } from './demuxer.js'
 import { concatWithSplice, findZeroCrossing } from '../audioSplice.js'
+import { createFrameTracker } from '../memoryGuard.js'
 
 const FPS = 30
 const FRAME_US = 1_000_000 / FPS
@@ -26,7 +27,7 @@ async function drainEncoder(encoder) {
   while (encoder.encodeQueueSize > 8) await tick()
 }
 async function drainDecoder(decoder) {
-  while (decoder.decodeQueueSize > 8) await tick()
+  while (decoder.decodeQueueSize > 4) await tick()
 }
 
 // Equal-power crossfade curve (cos/sin), not linear — a linear overlap dips in
@@ -51,14 +52,42 @@ function letterbox(fw, fh, W, H) {
 
 // ---- audio -------------------------------------------------------------
 
-async function buildAudioTrack(clips, plan, placements, totalSec, transitionSec, onProgress) {
+const RATE = 44100
+
+// Video encodes exactly round(segDur·FPS) frames per segment. The audio slice
+// must be exactly that many frames long, expressed at RATE — otherwise the two
+// drift apart by one rounding error per cut, and it accumulates.
+function videoFramesFor(seg) {
+  return Math.max(1, Math.round((seg.end - seg.start) * FPS))
+}
+function targetSamplesFor(seg) {
+  return Math.round((videoFramesFor(seg) / FPS) * RATE)
+}
+
+async function buildAudioTrack(clips, plan, totalSec, transitionSec, onProgress, onDiag) {
   const AC = window.AudioContext || window.webkitAudioContext
   if (!AC) return null
 
-  const RATE = 44100
-  const totalFrames = Math.max(1, Math.ceil(totalSec * RATE))
-  const L = new Float32Array(totalFrames)
-  const R = new Float32Array(totalFrames)
+  const segs = plan.segments
+  const hasTransition = segs.some((s, i) => i > 0 && s.transition !== 'cut')
+
+  // Frame-derived sample offsets for the place+sum (transition) path, mirroring
+  // the video timeline's overlap pull-back.
+  const audioOffsets = []
+  {
+    let cursor = 0
+    for (let i = 0; i < segs.length; i++) {
+      const len = Math.max(0.01, segs[i].end - segs[i].start)
+      if (i > 0 && segs[i].transition !== 'cut') cursor -= Math.round(Math.min(transitionSec, len / 2) * RATE)
+      audioOffsets.push(cursor)
+      cursor += targetSamplesFor(segs[i])
+    }
+  }
+
+  const allocFrames = Math.max(1, Math.ceil(totalSec * RATE) + RATE) // + 1s slack
+  const L = new Float32Array(allocFrames)
+  const R = new Float32Array(allocFrames)
+  let writtenFrames = 0
 
   const decoded = new Map() // clipId -> AudioBuffer | null
   const getAudio = async (clip) => {
@@ -75,9 +104,7 @@ async function buildAudioTrack(clips, plan, placements, totalSec, transitionSec,
     return buf
   }
 
-  const segs = plan.segments
-  const hasTransition = segs.some((s, i) => i > 0 && s.transition !== 'cut')
-  const rendered = [] // per-segment AudioBuffers, in order (only used when !hasTransition)
+  const rendered = [] // per-segment AudioBuffers, in order (pure-cut path only)
 
   for (let i = 0; i < segs.length; i++) {
     const seg = segs[i]
@@ -87,22 +114,21 @@ async function buildAudioTrack(clips, plan, placements, totalSec, transitionSec,
 
     onProgress({ stage: 'audio', pct: Math.round((i / segs.length) * 100), msg: `Mixing audio ${i + 1}/${segs.length}…` })
 
-    // Snap the slice in/out points to the nearest zero crossing in the source —
-    // this alone kills most of the splice click, before any fade.
-    let sliceStart = Math.max(0, seg.start)
-    let sliceEnd = Math.max(sliceStart + 0.01, seg.end)
+    // A/V SYNC: snap the in-point to a zero crossing to kill the splice click,
+    // then force the slice length back to match the video segment exactly. The
+    // ±10ms snap shifts the content, never the length — so nothing accumulates.
+    const targetSamples = targetSamplesFor(seg)
+    let snappedIn = Math.max(0, seg.start)
+    let snappedOut = seg.end
     if (src) {
       const sr = src.sampleRate
       const ch0 = src.getChannelData(0)
       const radius = Math.round(0.01 * sr)
-      sliceStart = findZeroCrossing(ch0, seg.start * sr, radius) / sr
-      sliceEnd = findZeroCrossing(ch0, seg.end * sr, radius) / sr
-      if (sliceEnd - sliceStart < 0.01) {
-        sliceStart = Math.max(0, seg.start)
-        sliceEnd = seg.end
-      }
+      snappedIn = findZeroCrossing(ch0, seg.start * sr, radius) / sr
+      snappedOut = findZeroCrossing(ch0, seg.end * sr, radius) / sr
+      if (!Number.isFinite(snappedIn) || snappedIn < 0) snappedIn = Math.max(0, seg.start)
     }
-    const segDur = Math.max(0.01, sliceEnd - sliceStart)
+    const segDur = targetSamples / RATE
 
     // Transitions overlap the neighbour → equal-power crossfade ramp (a
     // different case from a butt-joined splice, which gets edge fades below).
@@ -110,34 +136,52 @@ async function buildAudioTrack(clips, plan, placements, totalSec, transitionSec,
     const fadeOut =
       i < segs.length - 1 && segs[i + 1].transition !== 'cut' ? Math.min(transitionSec, segDur / 2) : 0
 
+    let buf
     if (!src) {
-      if (!hasTransition) rendered.push(new AudioBuffer({ length: Math.round(segDur * RATE), numberOfChannels: 2, sampleRate: RATE }))
-      continue
+      buf = new AudioBuffer({ length: targetSamples, numberOfChannels: 2, sampleRate: RATE })
+    } else {
+      // The OfflineAudioContext length forces the sample count exactly:
+      // overshoot of the source is trimmed, undershoot is silence (zero-pad).
+      const oac = new OfflineAudioContext(2, targetSamples, RATE)
+      const node = oac.createBufferSource()
+      node.buffer = src
+      const gain = oac.createGain()
+      node.connect(gain)
+      gain.connect(oac.destination)
+
+      gain.gain.setValueAtTime(1, 0)
+      if (fadeIn > 0) gain.gain.setValueCurveAtTime(equalPowerCurve('in'), 0, fadeIn)
+      if (fadeOut > 0) gain.gain.setValueCurveAtTime(equalPowerCurve('out'), Math.max(0, segDur - fadeOut), fadeOut)
+
+      node.start(0, snappedIn) // no duration arg — context length bounds it
+      buf = await oac.startRendering()
     }
 
-    const frames = Math.round(segDur * RATE)
-    const oac = new OfflineAudioContext(2, Math.max(1, frames), RATE)
-    const node = oac.createBufferSource()
-    node.buffer = src
-    const gain = oac.createGain()
-    node.connect(gain)
-    gain.connect(oac.destination)
+    if (buf.length !== targetSamples) {
+      console.warn(
+        `[renderer] A/V length mismatch at segment ${i}: audio ${buf.length} samples, expected ${targetSamples} (video ${videoFramesFor(seg)} frames)`,
+      )
+    }
 
-    gain.gain.setValueAtTime(1, 0)
-    if (fadeIn > 0) gain.gain.setValueCurveAtTime(equalPowerCurve('in'), 0, fadeIn)
-    if (fadeOut > 0) gain.gain.setValueCurveAtTime(equalPowerCurve('out'), Math.max(0, segDur - fadeOut), fadeOut)
-
-    node.start(0, sliceStart, segDur)
-    const buf = await oac.startRendering()
+    onDiag?.({
+      phase: 'audio',
+      index: i,
+      srcIn: +seg.start.toFixed(4),
+      srcOut: +seg.end.toFixed(4),
+      snappedAudioIn: +snappedIn.toFixed(4),
+      snappedAudioOut: +snappedOut.toFixed(4),
+      audioSamplesWritten: buf.length,
+      expectedSamples: targetSamples,
+    })
 
     if (!hasTransition) {
-      // Pure cut sequence — collect and butt-join with splice hygiene below.
-      rendered.push(buf)
+      rendered.push(buf) // butt-joined with splice hygiene below
+      writtenFrames += buf.length
       continue
     }
 
     // Mixed sequence: place + sum for the overlaps, but micro-fade this piece's
-    // edges first so any butt-joined (cut) edge doesn't click.
+    // butt-joined (cut) edges first so they don't click.
     const cl = buf.getChannelData(0)
     const cr = buf.numberOfChannels > 1 ? buf.getChannelData(1) : cl
     if (!fadeIn) {
@@ -148,11 +192,12 @@ async function buildAudioTrack(clips, plan, placements, totalSec, transitionSec,
       spliceFadeTail(cl, RATE)
       if (cr !== cl) spliceFadeTail(cr, RATE)
     }
-    const offFrame = Math.round(placements[i] * RATE)
-    for (let f = 0; f < cl.length && offFrame + f < totalFrames; f++) {
-      L[offFrame + f] += cl[f]
-      R[offFrame + f] += cr[f]
+    const off = Math.max(0, audioOffsets[i])
+    for (let f = 0; f < cl.length && off + f < allocFrames; f++) {
+      L[off + f] += cl[f]
+      R[off + f] += cr[f]
     }
+    writtenFrames = Math.max(writtenFrames, off + cl.length)
   }
 
   if (!hasTransition) {
@@ -166,15 +211,14 @@ async function buildAudioTrack(clips, plan, placements, totalSec, transitionSec,
     }
   }
 
-  // clamp any summed overlap
-  for (let i = 0; i < totalFrames; i++) {
+  const total = Math.min(allocFrames, Math.max(1, writtenFrames))
+  for (let i = 0; i < total; i++) {
     if (L[i] > 1) L[i] = 1
     else if (L[i] < -1) L[i] = -1
     if (R[i] > 1) R[i] = 1
     else if (R[i] < -1) R[i] = -1
   }
-
-  return { L, R, sampleRate: RATE, totalFrames }
+  return { L: L.subarray(0, total), R: R.subarray(0, total), sampleRate: RATE, totalFrames: total }
 }
 
 // One-sided equal-power edge fades for the mixed (place+sum) path — a transition
@@ -244,18 +288,18 @@ export async function renderWithWebCodecs(clips, plan, opts = {}, onProgress = (
   const { w: W, h: H, bitrate, codec } = RES[opts.resolution] || RES['720p']
   const transitionSec = Math.max(0, Math.min(1.5, opts.transitionDuration ?? 0.5))
   const tdFramesBase = Math.round(transitionSec * FPS)
+  const onDiag = typeof opts.onDiag === 'function' ? opts.onDiag : null
 
-  // Output-timeline placement (seconds) of each segment. A non-cut transition
-  // overlaps the previous segment by `transitionSec`, shortening the timeline.
-  const placements = []
+  // Nominal output-timeline length (seconds), accounting for transition overlap.
   let cursor = 0
   for (let i = 0; i < segs.length; i++) {
     const segDur = Math.max(0.01, segs[i].end - segs[i].start)
     if (i > 0 && segs[i].transition !== 'cut') cursor -= Math.min(transitionSec, segDur / 2)
-    placements.push(cursor)
     cursor += segDur
   }
   const timelineSec = Math.max(cursor, 0.1)
+
+  const frames = createFrameTracker()
 
   const target = new ArrayBufferTarget()
   const muxer = new Muxer({
@@ -321,12 +365,17 @@ export async function renderWithWebCodecs(clips, plan, opts = {}, onProgress = (
       const blendN = incoming !== 'cut' ? Math.min(tdFramesBase, tail.length, Math.floor(outFrames / 2)) : 0
       const holdN = nextTransition !== 'cut' ? Math.min(tdFramesBase, Math.floor(outFrames / 2)) : 0
       const newTail = []
+      const outIdxAtStart = outIdx
+      let encodedThisSeg = 0
 
       // --- decoder ------------------------------------------------------
       const decodedQueue = []
       let decoderError = null
       const decoder = new VideoDecoder({
-        output: (frame) => decodedQueue.push(frame),
+        output: (frame) => {
+          frames.track(frame)
+          decodedQueue.push(frame)
+        },
         error: (e) => {
           decoderError = e
         },
@@ -393,30 +442,37 @@ export async function renderWithWebCodecs(clips, plan, opts = {}, onProgress = (
           // here; the incoming segment encodes the blended result at this slot.
           newTail.push(await createImageBitmap(canvas))
         } else {
-          const outFrame = new VideoFrame(canvas, {
-            timestamp: Math.round(outIdx * FRAME_US),
-            duration: Math.round(FRAME_US),
-          })
+          const outFrame = frames.track(
+            new VideoFrame(canvas, {
+              timestamp: Math.round(outIdx * FRAME_US),
+              duration: Math.round(FRAME_US),
+            }),
+          )
           await drainEncoder(encoder)
           encoder.encode(outFrame, { keyFrame: outIdx % (FPS * 2) === 0 })
+          frames.release(outFrame)
           outFrame.close()
           outIdx++
+          encodedThisSeg++
         }
         localOut++
       }
 
       const consume = async (frame) => {
         if (segmentDone) {
+          frames.release(frame)
           frame.close()
           return
         }
         const ts = frame.timestamp
         if (ts + FRAME_US / 2 < startUs) {
+          frames.release(frame)
           frame.close() // before the in-point — discard
           return
         }
         if (ts >= endUs) {
           segmentDone = true
+          frames.release(frame)
           frame.close()
           return
         }
@@ -425,13 +481,35 @@ export async function renderWithWebCodecs(clips, plan, opts = {}, onProgress = (
           await renderOutputFrame(frame)
           nextSrcT += FRAME_US
         }
+        frames.release(frame)
         frame.close()
+      }
+
+      // Close every still-queued decoded frame (used on the error path so a
+      // decoder failure doesn't also leak frames).
+      const dropQueue = () => {
+        for (const f of decodedQueue.splice(0)) {
+          frames.release(f)
+          try {
+            f.close()
+          } catch {
+            /* already closed */
+          }
+        }
       }
 
       // --- feed chunks ----------------------------------------------
       let fedPastEnd = 0
       for (let j = firstIdx; j < samples.length; j++) {
-        if (decoderError) throw decoderError
+        if (decoderError) {
+          dropQueue()
+          try {
+            decoder.close()
+          } catch {
+            /* ignore */
+          }
+          throw decoderError
+        }
         const s = samples[j]
         decoder.decode(
           new EncodedVideoChunk({
@@ -442,7 +520,8 @@ export async function renderWithWebCodecs(clips, plan, opts = {}, onProgress = (
           }),
         )
         await drainDecoder(decoder)
-        while (decodedQueue.length > 12) await consume(decodedQueue.shift())
+        // Keep the decoded-frame backlog shallow (each frame is GPU memory).
+        while (decodedQueue.length > 6) await consume(decodedQueue.shift())
         // Feed a few samples past the out-point so reordered (B-)frames land.
         if (s.timestamp >= endUs) {
           if (++fedPastEnd > 3) break
@@ -450,30 +529,69 @@ export async function renderWithWebCodecs(clips, plan, opts = {}, onProgress = (
         if (localOut >= outFrames) break
       }
 
+      // Drain to empty BEFORE flush so the flush dump starts from a low base.
+      while (decodedQueue.length) await consume(decodedQueue.shift())
       await decoder.flush()
       while (decodedQueue.length) await consume(decodedQueue.shift())
       decoder.close()
-      if (decoderError) throw decoderError
+      if (decoderError) {
+        dropQueue()
+        throw decoderError
+      }
 
       // If the source ran short, pad the segment by repeating the last canvas.
       while (localOut < outFrames) {
         if (localOut >= outFrames - holdN) {
           newTail.push(await createImageBitmap(canvas))
         } else {
-          const vf = new VideoFrame(canvas, {
-            timestamp: Math.round(outIdx * FRAME_US),
-            duration: Math.round(FRAME_US),
-          })
+          const vf = frames.track(
+            new VideoFrame(canvas, {
+              timestamp: Math.round(outIdx * FRAME_US),
+              duration: Math.round(FRAME_US),
+            }),
+          )
           await drainEncoder(encoder)
           encoder.encode(vf, { keyFrame: outIdx % (FPS * 2) === 0 })
+          frames.release(vf)
           vf.close()
           outIdx++
+          encodedThisSeg++
         }
         localOut++
       }
 
       for (const b of tail) b.close()
       tail = newTail
+
+      // Leak tripwire — surfaces the exact segment, not a dead tab 20s later.
+      const peakOpen = frames.peak()
+      frames.assertDrained(`segment ${si}`)
+      frames.resetPeak()
+      console.debug(`[renderer] segment ${si}: ${encodedThisSeg} frames encoded, peak open ${peakOpen}`)
+      if (peakOpen > 20) {
+        console.warn(`[renderer] segment ${si} peak open frames ${peakOpen} — backpressure may be slipping`)
+      }
+
+      // Timeline attribution: intended output-ts range for this segment vs the
+      // timestamps actually stamped on its first/last encoded frame.
+      const intendedFirstUs = Math.round(outIdxAtStart * FRAME_US)
+      const intendedLastUs = Math.round(Math.max(outIdxAtStart, outIdx - 1) * FRAME_US)
+      console.debug(
+        `[renderer] segment ${si}: out frames [${outIdxAtStart}..${outIdx}) ` +
+          `= ${(outIdxAtStart / FPS).toFixed(3)}s..${(outIdx / FPS).toFixed(3)}s ` +
+          `| first/last frame ts ${(intendedFirstUs / 1e6).toFixed(3)}s/${(intendedLastUs / 1e6).toFixed(3)}s ` +
+          `| src ${segDurSec.toFixed(3)}s (${Math.round(segDurSec * FPS)} frames nominal)`,
+      )
+
+      onDiag?.({
+        phase: 'video',
+        index: si,
+        srcIn: +seg.start.toFixed(4),
+        srcOut: +seg.end.toFixed(4),
+        videoFramesEncoded: encodedThisSeg,
+        outIdxRange: [outIdxAtStart, outIdx],
+        peakOpenFrames: peakOpen,
+      })
 
       onProgress({
         stage: 'video',
@@ -490,8 +608,34 @@ export async function renderWithWebCodecs(clips, plan, opts = {}, onProgress = (
 
     // --- audio ------------------------------------------------------
     onProgress({ stage: 'audio', pct: 0, msg: 'Building audio track…' })
-    const audioTrack = await buildAudioTrack(clips, plan, placements, timelineSec, transitionSec, onProgress)
+    const audioTrack = await buildAudioTrack(clips, plan, timelineSec, transitionSec, onProgress, onDiag)
     await encodeAudio(audioTrack, muxer, onProgress)
+
+    // Timeline attribution: expected total = Σ segment durations − Σ transition
+    // overlaps. Compare against what video and audio actually produced.
+    const sumSegDur = segs.reduce((acc, s) => acc + Math.max(0, s.end - s.start), 0)
+    let sumTransition = 0
+    for (let i = 1; i < segs.length; i++) {
+      if (segs[i].transition && segs[i].transition !== 'cut') {
+        sumTransition += Math.min(transitionSec, (segs[i].end - segs[i].start) / 2)
+      }
+    }
+    const expectedTotalSec = sumSegDur - sumTransition
+    const actualVideoSec = outIdx / FPS
+    const actualAudioSec = audioTrack ? audioTrack.totalFrames / audioTrack.sampleRate : 0
+    console.debug(
+      `[renderer] timeline: expected ${expectedTotalSec.toFixed(3)}s ` +
+        `(Σseg ${sumSegDur.toFixed(3)} − Σtransition ${sumTransition.toFixed(3)}) · ` +
+        `video ${actualVideoSec.toFixed(3)}s (Δ ${((actualVideoSec - expectedTotalSec) * 1000).toFixed(0)}ms) · ` +
+        `audio ${actualAudioSec.toFixed(3)}s (Δ ${((actualAudioSec - expectedTotalSec) * 1000).toFixed(0)}ms)`,
+    )
+    onDiag?.({
+      phase: 'timeline',
+      expectedTotalSec: +expectedTotalSec.toFixed(4),
+      actualVideoSec: +actualVideoSec.toFixed(4),
+      actualAudioSec: +actualAudioSec.toFixed(4),
+      videoFrames: outIdx,
+    })
 
     // --- mux ------------------------------------------------------
     onProgress({ stage: 'mux', pct: 98, msg: 'Writing MP4…' })

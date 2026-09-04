@@ -30,14 +30,24 @@ export async function demux(file) {
 
   let info = null
   let parseError = null
-  let extractionStarted = false
   const samples = []
 
   mp4.onError = (e) => {
     parseError = new Error(`mp4box could not parse "${file.name}": ${e}`)
   }
+  // Arm extraction from INSIDE onReady. A fragmented MP4 (MediaRecorder output,
+  // some phones/apps) can carry moov + every moof fragment in a single
+  // appendBuffer; if start() isn't called before that call returns, the
+  // fragments are parsed with no extraction armed and onSamples never fires.
   mp4.onReady = (i) => {
     info = i
+    const v = i.videoTracks?.[0]
+    if (!v) {
+      parseError = new Error(`"${file.name}" has no video track WebCodecs can decode.`)
+      return
+    }
+    mp4.setExtractionOptions(v.id, 'video', { nbSamples: Infinity })
+    mp4.start()
   }
   mp4.onSamples = (_id, user, chunk) => {
     if (user !== 'video') return
@@ -52,18 +62,6 @@ export async function demux(file) {
     }
   }
 
-  const startExtraction = () => {
-    if (extractionStarted || !info) return
-    const v = info.videoTracks?.[0]
-    if (!v) {
-      parseError = new Error(`"${file.name}" has no video track WebCodecs can decode.`)
-      return
-    }
-    mp4.setExtractionOptions(v.id, 'video', { nbSamples: Infinity })
-    mp4.start()
-    extractionStarted = true
-  }
-
   for (let off = 0; off < buffer.byteLength; off += FEED_CHUNK) {
     const part = MP4BoxBuffer.fromArrayBuffer(
       buffer.slice(off, Math.min(off + FEED_CHUNK, buffer.byteLength)),
@@ -71,15 +69,16 @@ export async function demux(file) {
     )
     mp4.appendBuffer(part)
     if (parseError) throw parseError
-    startExtraction()
-    if (parseError) throw parseError
   }
   mp4.flush()
   if (parseError) throw parseError
   if (!info) throw new Error(`Could not read the MP4 structure of "${file.name}" (no moov box).`)
 
-  const v = info.videoTracks[0]
-  const a = info.audioTracks?.[0] || null
+  // Re-read after flush: a fragmented file only knows its true sample count and
+  // duration once every moof has been parsed.
+  const fresh = (typeof mp4.getInfo === 'function' && mp4.getInfo()) || info
+  const v = fresh.videoTracks?.[0] || info.videoTracks[0]
+  const a = fresh.audioTracks?.[0] || info.audioTracks?.[0] || null
 
   const trak = mp4.getTrackById(v.id)
   let description
@@ -101,7 +100,7 @@ export async function demux(file) {
       durationSec: v.duration / v.timescale,
       width: v.track_width || v.video?.width || 0,
       height: v.track_height || v.video?.height || 0,
-      nbSamples: v.nb_samples,
+      nbSamples: v.nb_samples || samples.length,
       description,
     },
     audioTrack: a

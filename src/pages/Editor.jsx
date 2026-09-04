@@ -7,6 +7,7 @@ import { extendTakeRange } from '../utils/retakes.js'
 import { generateEditPlan, USE_MOCK } from '../utils/ai.js'
 import { render, estimateRenderSeconds } from '../utils/videoProcessor.js'
 import { checkWebCodecsSupport } from '../utils/webcodecs/support.js'
+import { verifyRender, measureSync } from '../utils/verify.js'
 
 const PX_PER_SEC = 26
 
@@ -44,6 +45,10 @@ export default function Editor() {
   const [result, setResult] = useState(null) // { url, size, method, fellBack, ... }
   const [renderError, setRenderError] = useState('')
   const [engine, setEngine] = useState(null) // checkWebCodecsSupport() result
+  const [verifyState, setVerifyState] = useState(null) // { running, report, sync } | null
+  const [verifyOpen, setVerifyOpen] = useState(false)
+  const [diagnostics, setDiagnostics] = useState(false)
+  const [smoke, setSmoke] = useState(null) // { running, log[], ok } | null
 
   const fileInputRef = useRef(null)
   const videoRef = useRef(null)
@@ -352,11 +357,28 @@ export default function Editor() {
   }, [clips, prompt, aiState, analysis, transcriptsMap, applyTextEdits])
 
   // ---- render -----------------------------------------------------------
+  const diagLog = useCallback((d) => {
+    if (d.phase === 'video') {
+      console.log(
+        `[render:seg ${d.index}] src ${d.srcIn}–${d.srcOut}s · frames encoded ${d.videoFramesEncoded} · outIdx ${d.outIdxRange?.join('→')} · peak open ${d.peakOpenFrames}`,
+      )
+    } else if (d.phase === 'audio') {
+      console.log(
+        `[render:seg ${d.index}] audio snapped ${d.snappedAudioIn}–${d.snappedAudioOut}s · samples ${d.audioSamplesWritten}/${d.expectedSamples}`,
+      )
+    } else if (d.phase === 'ffmpeg-part') {
+      console.log(
+        `[render:part ${d.index}] ${d.clip} · src ${d.srcIn}–${d.srcOut}s · dur ${d.partDuration}s · audio ${d.audio}`,
+      )
+    }
+  }, [])
+
   const runRender = useCallback(async () => {
     if (rendering || !clips.length) return
     setRendering(true)
     setRenderError('')
     setResult(null)
+    setVerifyState(null)
     setProgress({ stage: 'engine', pct: 0, msg: 'Preparing…' })
     try {
       const base =
@@ -375,14 +397,47 @@ export default function Editor() {
         }
       // Fresh object so we don't mutate the stored plan with render-time cuts.
       const effectivePlan = applyTextEdits({ ...base, segments: base.segments })
-      const out = await render(clips, effectivePlan, { resolution }, (p) => setProgress(p))
+      const out = await render(
+        clips,
+        effectivePlan,
+        { resolution, onDiag: diagnostics ? diagLog : undefined },
+        (p) => setProgress(p),
+      )
       setResult(out)
+
+      // Every render is verified — no "looks done" without a check.
+      setVerifyState({ running: true, report: null, sync: null })
+      try {
+        const [report, sync] = await Promise.all([verifyRender(out.url, out), measureSync(out.url)])
+        setVerifyState({ running: false, report, sync })
+        if (diagnostics) console.log('[verify]', report, sync)
+      } catch (e) {
+        setVerifyState({ running: false, report: { ok: false, checks: [{ name: 'verify', passed: false, detail: e.message }], warnings: [] }, sync: null })
+      }
     } catch (err) {
       setRenderError(err.message || 'Render failed.')
     } finally {
       setRendering(false)
     }
-  }, [rendering, clips, plan, resolution, applyTextEdits])
+  }, [rendering, clips, plan, resolution, applyTextEdits, diagnostics, diagLog])
+
+  const doSmokeTest = useCallback(async () => {
+    if (smoke?.running) return
+    const log = []
+    setSmoke({ running: true, log: [], ok: null })
+    const push = (line) => {
+      log.push(line)
+      setSmoke({ running: true, log: [...log], ok: null })
+    }
+    try {
+      const { runSmokeTest } = await import('../utils/smokeTest.js')
+      const res = await runSmokeTest(push, diagnostics ? diagLog : undefined)
+      setSmoke({ running: false, log: [...log], ok: res.ok, results: res.results })
+    } catch (e) {
+      push(`✗ threw: ${e.message}`)
+      setSmoke({ running: false, log: [...log], ok: false })
+    }
+  }, [smoke, diagnostics, diagLog])
 
   // Blocks for the timeline video track.
   const videoBlocks = useMemo(() => {
@@ -1026,6 +1081,33 @@ export default function Editor() {
                 {rendering ? 'Rendering…' : plan ? 'Render plan' : 'Render straight cut'}
               </button>
 
+              <label className="ed-toggle ed-mt">
+                <input
+                  type="checkbox"
+                  checked={diagnostics}
+                  onChange={(e) => setDiagnostics(e.target.checked)}
+                />
+                <span>Diagnostics (per-segment console log)</span>
+              </label>
+
+              {import.meta.env.DEV && (
+                <button
+                  className="ed-btn ed-btn-block ed-mt"
+                  onClick={doSmokeTest}
+                  disabled={smoke?.running || rendering}
+                >
+                  {smoke?.running ? 'Running smoke test…' : 'Run smoke test'}
+                </button>
+              )}
+
+              {smoke && (
+                <div className={`ed-smoke${smoke.ok === false ? ' is-bad' : smoke.ok ? ' is-ok' : ''}`}>
+                  {smoke.log.map((line, i) => (
+                    <div key={i}>{line}</div>
+                  ))}
+                </div>
+              )}
+
               {clips.length > 0 && !rendering && (
                 <p className="ed-dim ed-mt">
                   {!plan && 'No AI plan yet — this stitches your clips end to end. '}
@@ -1071,6 +1153,45 @@ export default function Editor() {
                         result.fallbackReason ? ` — ${result.fallbackReason}` : ''
                       }.`}
                   </div>
+
+                  {verifyState && (
+                    <div className="ed-verify">
+                      {verifyState.running ? (
+                        <div className="ed-dim">
+                          <span className="ed-spin" /> Verifying render…
+                        </div>
+                      ) : (
+                        <>
+                          <button
+                            className={`ed-verify-head${verifyState.report?.ok ? ' is-ok' : ' is-bad'}`}
+                            onClick={() => setVerifyOpen((v) => !v)}
+                          >
+                            {verifyState.report?.ok
+                              ? `✓ All ${verifyState.report.checks.length} checks passed`
+                              : `✗ ${verifyState.report?.checks.filter((c) => !c.passed).length || '?'} check(s) failed`}
+                            <span className="ed-verify-caret">{verifyOpen ? '▾' : '▸'}</span>
+                          </button>
+                          {verifyState.sync && Number.isFinite(verifyState.sync.deltaMs) && (
+                            <div className={`ed-sync${verifyState.sync.drift ? ' is-bad' : ''}`}>
+                              A/V sync: {verifyState.sync.deltaMs}ms
+                              {verifyState.sync.drift && ' — drift'}
+                            </div>
+                          )}
+                          {verifyOpen && (
+                            <ul className="ed-verify-list">
+                              {verifyState.report?.checks.map((c, i) => (
+                                <li key={i} className={c.passed ? 'is-ok' : 'is-bad'}>
+                                  <strong>{c.passed ? '✓' : '✗'} {c.name}</strong>
+                                  <span>{c.detail}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  )}
+
                   <video src={result.url} controls className="ed-result-vid" />
                   <a
                     className="ed-btn ed-btn-primary ed-btn-block"
@@ -1257,6 +1378,27 @@ const CSS = `
 
 .ed-result { margin-top: 16px; display: flex; flex-direction: column; gap: 10px; }
 .ed-result-vid { width: 100%; border-radius: 8px; background: #000; }
+
+.ed-toggle { display: flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--muted); cursor: pointer; }
+.ed-toggle input { accent-color: var(--purple); }
+
+.ed-smoke { margin-top: 10px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); background: #05050e; font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; line-height: 1.5; color: var(--muted); max-height: 220px; overflow-y: auto; white-space: pre-wrap; }
+.ed-smoke.is-ok { border-color: rgba(9,246,255,.4); }
+.ed-smoke.is-bad { border-color: var(--pink); }
+
+.ed-verify { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; }
+.ed-verify-head { display: flex; align-items: center; justify-content: space-between; width: 100%; background: none; border: none; padding: 0; font-size: 12px; font-weight: 600; text-align: left; }
+.ed-verify-head.is-ok { color: var(--cyan); }
+.ed-verify-head.is-bad { color: var(--pink); }
+.ed-verify-caret { color: var(--muted); font-size: 10px; }
+.ed-sync { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.ed-sync.is-bad { color: var(--pink); font-weight: 600; }
+.ed-verify-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.ed-verify-list li { display: flex; flex-direction: column; gap: 1px; font-size: 10.5px; }
+.ed-verify-list li strong { font-size: 11px; }
+.ed-verify-list li.is-ok strong { color: var(--cyan); }
+.ed-verify-list li.is-bad strong { color: var(--pink); }
+.ed-verify-list li span { color: var(--muted); }
 
 .ed-seg { border: 1px solid var(--border); border-radius: 8px; padding: 8px; margin-bottom: 8px; background: var(--surface); }
 .ed-seg-top { display: flex; justify-content: space-between; gap: 6px; font-size: 11.5px; font-weight: 600; }

@@ -61,51 +61,87 @@ export function probeVideo(file) {
     }
 
     video.onloadedmetadata = () => {
-      const duration = video.duration
       const width = video.videoWidth
       const height = video.videoHeight
-      if (!isFinite(duration) || duration <= 0 || !width || !height) {
-        fail(`"${file.name}" has no readable video track (duration/size missing).`)
+      if (!width || !height) {
+        fail(`"${file.name}" has no readable video track (dimensions missing).`)
         return
       }
 
-      const seekTo = Math.min(duration * 0.1, 2)
-
-      video.onseeked = () => {
+      // Grab the thumbnail frame and resolve, given a known-good duration.
+      const proceed = (duration) => {
         if (done) return
-        let thumb = ''
-        try {
-          const cw = 160
-          const ch = Math.max(1, Math.round((cw * height) / width))
-          const canvas = document.createElement('canvas')
-          canvas.width = cw
-          canvas.height = ch
-          const ctx = canvas.getContext('2d')
-          ctx.drawImage(video, 0, 0, cw, ch)
-          thumb = canvas.toDataURL('image/jpeg', 0.6)
-        } catch {
-          thumb = '' // tainted canvas or draw failure — not fatal
+        if (!isFinite(duration) || duration <= 0) {
+          fail(`"${file.name}" still reports a non-finite duration — cannot use it.`)
+          return
         }
-        done = true
-        clearTimeout(timer)
-        cleanup()
-        resolve({
-          id: nextId(),
-          file,
-          url,
-          name: file.name,
-          size: file.size,
-          duration,
-          width,
-          height,
-          thumb,
-        })
+
+        const seekTo = Math.min(duration * 0.1, 2)
+
+        video.onseeked = () => {
+          if (done) return
+          let thumb = ''
+          try {
+            const cw = 160
+            const ch = Math.max(1, Math.round((cw * height) / width))
+            const canvas = document.createElement('canvas')
+            canvas.width = cw
+            canvas.height = ch
+            const ctx = canvas.getContext('2d')
+            ctx.drawImage(video, 0, 0, cw, ch)
+            thumb = canvas.toDataURL('image/jpeg', 0.6)
+          } catch {
+            thumb = '' // tainted canvas or draw failure — not fatal
+          }
+          done = true
+          clearTimeout(timer)
+          cleanup()
+          resolve({
+            id: nextId(),
+            file,
+            url,
+            name: file.name,
+            size: file.size,
+            duration,
+            width,
+            height,
+            thumb,
+          })
+        }
+
+        try {
+          video.currentTime = seekTo
+        } catch {
+          fail(`Could not seek within "${file.name}".`)
+        }
       }
 
-      try {
-        video.currentTime = seekTo
-      } catch {
-        fail(`Could not seek within "${file.name}".`)
+      // MediaRecorder WebM reports duration: Infinity until the element is
+      // seeked past the end. Force it, read the real duration on the next
+      // timeupdate, rewind, then carry on.
+      if (!isFinite(video.duration)) {
+        const onTimeUpdate = () => {
+          video.removeEventListener('timeupdate', onTimeUpdate)
+          const real = video.duration
+          const afterRewind = () => {
+            video.removeEventListener('seeked', afterRewind)
+            proceed(real)
+          }
+          video.addEventListener('seeked', afterRewind)
+          try {
+            video.currentTime = 0
+          } catch {
+            proceed(real)
+          }
+        }
+        video.addEventListener('timeupdate', onTimeUpdate)
+        try {
+          video.currentTime = 1e101
+        } catch {
+          fail(`Could not resolve the duration of "${file.name}".`)
+        }
+      } else {
+        proceed(video.duration)
       }
     }
   })
