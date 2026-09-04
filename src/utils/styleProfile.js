@@ -14,7 +14,16 @@ const SAMPLE_W = 64 // downscaled width for luma diffing
 const ROLLING_WINDOW = 24 // diffs kept for the rolling median (~6s at 4fps)
 const HARD_CUT_RATIO = 3.5 // single-sample spike above this × median = hard cut
 const TRANSITION_RATIO = 1.8 // sustained elevation above this × median
-const MIN_SHOT_S = 0.4 // ignore a cut within this of the previous one
+// A hard cut is an IMPULSE — one sample far above its neighbours. A crossfade is
+// a PLATEAU — adjacent samples similarly elevated. Without this, a gentle
+// crossfade over a quiet baseline still clears HARD_CUT_RATIO and gets
+// misfiled as a hard cut, which zeroes out transitionRatio for creators who
+// crossfade everything.
+const PEAK_DOMINANCE = 1.9
+// Ignore a boundary within this of the previous one. One real cut can raise two
+// events — the impulse itself, plus the encoder settling into the new shot a
+// beat later — so this window merges them, keeping whichever is stronger.
+const MIN_SHOT_S = 0.4
 // The spec's "sustained for 8-20 frames" is expressed in SOURCE frames (~0.27s
 // to 0.67s at 30fps). We sample at 4fps, so the resolvable equivalent is a run
 // of 2-6 samples (0.5s-1.5s), which also covers the crossfade lengths this app
@@ -165,59 +174,91 @@ export async function analyzeEditedVideo(file, onProgress = () => {}) {
   }
 }
 
-/** Split the diff series into shots. Exported for testing. */
+/**
+ * Split the diff series into shots. Exported for testing.
+ *
+ * Known limit: two crossfades around a shot shorter than about 1.5s merge into
+ * one elevated run — that shot is entirely blend, so the diff never returns to
+ * baseline between them and they read as a single boundary. Measured at 4fps on
+ * real renders: hard cuts 4/4, back-to-back crossfades 3/4. Loosening the
+ * thresholds to catch it reintroduces false positives on lighting changes,
+ * which is the whole reason the baseline is a rolling median.
+ */
 export function detectCuts(diffs, duration) {
-  const events = [] // { t, kind: 'cut'|'transition', ratio }
+  const n = diffs.length
+  const step = 1 / SAMPLE_FPS
+  const ratios = new Array(n).fill(0)
   const window = []
 
-  const rollingMedian = () => {
-    if (!window.length) return 0
-    return median(window)
-  }
-
-  let run = null // { startIdx, peak, samples }
-
-  const closeRun = () => {
-    if (!run) return
-    const len = run.samples
-    if (len === 1 && run.peak >= HARD_CUT_RATIO) {
-      events.push({ t: run.t, kind: 'cut', ratio: run.peak })
-    } else if (len >= TRANSITION_MIN_SAMPLES && len <= TRANSITION_MAX_SAMPLES) {
-      events.push({ t: run.t, kind: 'transition', ratio: run.peak })
-    }
-    // A run of 1 below the hard-cut ratio is noise; a run longer than the
-    // transition window is camera movement or a lighting change, not an edit.
-    run = null
-  }
-
-  for (let i = 0; i < diffs.length; i++) {
-    const med = rollingMedian()
-    const ratio = med > 1e-6 ? diffs[i].diff / med : diffs[i].diff > 0.02 ? HARD_CUT_RATIO : 0
-
-    if (ratio >= TRANSITION_RATIO) {
-      if (run) {
-        run.samples++
-        run.peak = Math.max(run.peak, ratio)
-      } else {
-        run = { t: diffs[i].t, peak: ratio, samples: 1 }
-      }
-    } else {
-      closeRun()
-    }
-
+  for (let i = 0; i < n; i++) {
+    const med = window.length ? median(window) : 0
+    ratios[i] =
+      med > 1e-6 ? diffs[i].diff / med : diffs[i].diff > 0.02 ? HARD_CUT_RATIO * 2 : 0
     // The rolling baseline must track ordinary motion, not the spikes it is
     // measuring against, so elevated samples are kept out of the window.
-    if (ratio < TRANSITION_RATIO) {
+    if (ratios[i] < TRANSITION_RATIO) {
       window.push(diffs[i].diff)
       if (window.length > ROLLING_WINDOW) window.shift()
     }
   }
-  closeRun()
 
-  // Drop anything too close to its predecessor — flicker, not an edit.
+  const isCut = new Array(n).fill(false)
+  const events = [] // { t, kind: 'cut'|'transition', ratio }
+
+  // Pass 1 — hard cuts. A LOCAL PEAK above the hard-cut ratio, judged on its own
+  // merits rather than on whether the next sample settles: cutting into a busy
+  // shot leaves the following sample elevated too, and an earlier version of
+  // this that required a single-sample spike dropped those cuts entirely.
+  for (let i = 0; i < n; i++) {
+    if (ratios[i] < HARD_CUT_RATIO) continue
+    const prev = i > 0 ? ratios[i - 1] : 0
+    const next = i < n - 1 ? ratios[i + 1] : 0
+    const tallestNeighbour = Math.max(prev, next, 1)
+    // Local peak AND clearly dominant over its neighbours — an impulse, not the
+    // shoulder of a crossfade.
+    if (ratios[i] >= prev && ratios[i] >= next && ratios[i] >= tallestNeighbour * PEAK_DOMINANCE) {
+      events.push({ t: Math.max(0, diffs[i].t - step / 2), kind: 'cut', ratio: ratios[i] })
+      isCut[i] = true
+    }
+  }
+
+  // Pass 2 — transitions: a sustained elevated run that contains no hard cut.
+  let i = 0
+  while (i < n) {
+    if (ratios[i] < TRANSITION_RATIO) {
+      i++
+      continue
+    }
+    let j = i
+    let peak = 0
+    let containsCut = false
+    while (j < n && ratios[j] >= TRANSITION_RATIO) {
+      peak = Math.max(peak, ratios[j])
+      if (isCut[j]) containsCut = true
+      j++
+    }
+    const len = j - i
+    // A run longer than the window is camera movement or a lighting change; a
+    // run of one that the impulse test already declined is noise. (Accepting
+    // lone sub-dominant peaks here was tried and rejected — it did not recover
+    // the merged-crossfade case and it added a false positive on hard cuts.)
+    if (!containsCut && len >= TRANSITION_MIN_SAMPLES && len <= TRANSITION_MAX_SAMPLES) {
+      events.push({ t: Math.max(0, diffs[i].t - step / 2), kind: 'transition', ratio: peak })
+    }
+    i = j
+  }
+
+  events.sort((a, b) => a.t - b.t)
+
+  // Collapse anything too close to its predecessor — flicker or a double
+  // detection of one cut, not two edits. Keep whichever read strongest.
   const kept = []
   for (const e of events) {
-    if (kept.length && e.t - kept[kept.length - 1].t < MIN_SHOT_S) continue
+    const last = kept[kept.length - 1]
+    if (last && e.t - last.t < MIN_SHOT_S) {
+      if (e.ratio > last.ratio) kept[kept.length - 1] = { ...e, t: last.t }
+      continue
+    }
     kept.push(e)
   }
 

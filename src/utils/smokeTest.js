@@ -196,6 +196,124 @@ async function captionTimelineCheck(clips, onDiag, log) {
 }
 
 /**
+ * Record a synthetic "already edited" video: hard cuts at KNOWN times, with
+ * gentle motion inside each shot so the rolling-median baseline is realistic
+ * rather than degenerately zero.
+ */
+async function makeEditedTestVideo(shotLengths, w = 640, h = 360) {
+  const canvas = document.createElement('canvas')
+  canvas.width = w
+  canvas.height = h
+  const ctx = canvas.getContext('2d')
+
+  // Distinct lightness per shot — a cut has to move luma, not just hue.
+  const lightness = [14, 76, 32, 90, 46, 66, 22, 82]
+  const bounds = []
+  let acc = 0
+  for (const len of shotLengths) {
+    acc += len
+    bounds.push(acc)
+  }
+  const total = acc
+
+  // Video-only stream — must NOT request an audio codec or MediaRecorder stalls
+  // waiting for a track that will never arrive.
+  const videoOnly = ['video/mp4;codecs=avc1.42E01E', 'video/mp4', 'video/webm;codecs=vp8', 'video/webm']
+  const mime = videoOnly.find((m) => MediaRecorder.isTypeSupported?.(m)) || 'video/webm'
+  const rec = new MediaRecorder(canvas.captureStream(30), {
+    mimeType: mime,
+    videoBitsPerSecond: 3_000_000,
+  })
+  const chunks = []
+  rec.ondataavailable = (e) => e.data.size && chunks.push(e.data)
+  const stopped = new Promise((r) => (rec.onstop = r))
+
+  let raf = 0
+  const t0 = performance.now()
+  const draw = () => {
+    const t = (performance.now() - t0) / 1000
+    let shot = 0
+    while (shot < bounds.length - 1 && t >= bounds[shot]) shot++
+    const L = lightness[shot % lightness.length]
+    ctx.fillStyle = `hsl(${shot * 47} 12% ${L}%)`
+    ctx.fillRect(0, 0, w, h)
+    // small in-shot movement → a non-zero baseline diff, like real footage
+    ctx.fillStyle = `hsl(${shot * 47} 60% ${Math.min(95, L + 18)}%)`
+    ctx.beginPath()
+    ctx.arc(w / 2 + Math.sin(t * 2.2) * w * 0.18, h / 2 + Math.cos(t * 1.7) * h * 0.12, 26, 0, Math.PI * 2)
+    ctx.fill()
+    raf = requestAnimationFrame(draw)
+  }
+  draw()
+  rec.start()
+  await new Promise((r) => setTimeout(r, total * 1000 + 250))
+  rec.stop()
+  cancelAnimationFrame(raf)
+  await stopped
+
+  const type = (rec.mimeType.split(';')[0] || 'video/webm').trim()
+  const blob = new Blob(chunks, { type })
+  return new File([blob], `edited.${type.includes('mp4') ? 'mp4' : 'webm'}`, { type })
+}
+
+/**
+ * Cut detection is the load-bearing part of style profiles — if it is off by 2×,
+ * every number in the profile is fiction. Assert against a video whose shot
+ * lengths we chose.
+ */
+async function styleProfileCheck(log) {
+  const shotLengths = [1.5, 2.0, 1.0, 2.5, 1.2, 1.8]
+  const trueCuts = shotLengths.length - 1
+  const sorted = [...shotLengths].sort((x, y) => x - y)
+  const trueMedian = (sorted[2] + sorted[3]) / 2
+
+  log(`  Building a synthetic edit: ${shotLengths.length} shots, ${trueCuts} cuts, ${shotLengths.reduce((s, n) => s + n, 0).toFixed(1)}s`)
+  const file = await makeEditedTestVideo(shotLengths)
+  log(`  Recorded ${(file.size / 1024).toFixed(0)}KB (${file.type}); scanning at 4fps…`)
+
+  let lastPct = -1
+  const a = await analyzeEditedVideo(file, (p) => {
+    if (p.pct >= lastPct + 25) {
+      lastPct = p.pct
+      log(`    ${p.msg}`)
+    }
+  })
+  const detected = a.cutCount + a.transitionCount
+
+  const cutTol = Math.max(1, trueCuts * 0.15)
+  const cutOk = Math.abs(detected - trueCuts) <= cutTol
+  const detectedMedian = median(a.shotLengths)
+  const medTol = trueMedian * 0.2
+  const medOk = Math.abs(detectedMedian - trueMedian) <= medTol
+
+  log(
+    `  ${cutOk ? '✓' : '✗'} cuts: detected ${detected}, actual ${trueCuts} (${a.cutCount} hard, ${a.transitionCount} transition) — tolerance ±${cutTol.toFixed(1)}`,
+  )
+  log(
+    `  ${medOk ? '✓' : '✗'} median shot: detected ${detectedMedian.toFixed(2)}s, actual ${trueMedian.toFixed(2)}s — tolerance ±${medTol.toFixed(2)}s`,
+  )
+  log(`  confidence ${a.confidence.toFixed(2)} · shots ${a.shotLengths.map((n) => n.toFixed(1)).join(', ')}`)
+
+  let profileLine = ''
+  try {
+    const p = buildProfile([a], 'Smoke style')
+    profileLine = describeProfile(p)
+    log(`  profile: ${profileLine}`)
+  } catch (e) {
+    log(`  ✗ buildProfile: ${e.message}`)
+  }
+
+  return { ok: cutOk && medOk, detected, trueCuts, detectedMedian, trueMedian, confidence: a.confidence }
+}
+
+function median(xs) {
+  if (!xs?.length) return 0
+  const s = [...xs].sort((a, b) => a - b)
+  const m = s.length >> 1
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2
+}
+
+/**
  * @param {(line:string)=>void} log
  * @param {(d:object)=>void} [onDiag]
  * @returns {Promise<{ok:boolean, results:object, mime:string, isMp4:boolean}>}
@@ -204,6 +322,17 @@ export async function runSmokeTest(log = () => {}, onDiag) {
   if (typeof MediaRecorder === 'undefined') {
     log('✗ MediaRecorder is unavailable in this browser')
     return { ok: false, results: {}, mime: '', isMp4: false }
+  }
+
+  // Style-profile cut detection runs FIRST: it is independent of the render
+  // pipeline, and recording a fresh clip is more reliable before several
+  // encoders have been spun up and torn down in this page.
+  log('── style profile: cut detection accuracy ──')
+  let styleCheck = { ok: false }
+  try {
+    styleCheck = await styleProfileCheck(log)
+  } catch (e) {
+    log(`  ✗ ${e?.message || e}`)
   }
 
   log(`Recording 2 test clips (requested ${pickMime()})…`)
@@ -247,6 +376,8 @@ export async function runSmokeTest(log = () => {}, onDiag) {
   log('── caption timeline (3 segments, fade transitions) ──')
   const capCheck = await captionTimelineCheck(clips, onDiag, log)
   results.captionTimeline = capCheck
+  results.styleProfile = styleCheck
+
 
   clips.forEach((c) => URL.revokeObjectURL(c.url))
 
@@ -269,7 +400,7 @@ export async function runSmokeTest(log = () => {}, onDiag) {
   // (otherwise there is nothing for mp4box to demux — not a real failure).
   const capOk = !!capCheck.ffmpeg?.ok && (isMp4 ? !!capCheck.webcodecs?.ok : true)
   const overallOk =
-    !!results.ffmpeg?.ok && (isMp4 ? !!results.webcodecs?.ok : true) && capOk
+    !!results.ffmpeg?.ok && (isMp4 ? !!results.webcodecs?.ok : true) && capOk && !!styleCheck.ok
   log(overallOk ? '✅ SMOKE TEST PASSED' : '❌ SMOKE TEST FAILED')
 
   return { ok: overallOk, results, mime, isMp4 }
