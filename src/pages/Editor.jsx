@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { probeAll, fmtTime, fmtSize } from '../utils/videoMeta.js'
 import { analyzeAll, withTranscript } from '../utils/analyzer.js'
 import { transcribeClip } from '../utils/transcribe.js'
@@ -9,21 +9,38 @@ import { render, estimateRenderSeconds, applyCutRanges } from '../utils/videoPro
 import { checkWebCodecsSupport } from '../utils/webcodecs/support.js'
 import { verifyRender, measureSync } from '../utils/verify.js'
 import { buildCaptions, remapToOutputTimeline, toSRT, toVTT } from '../utils/captions.js'
+import { analyzeEditedVideo, buildProfile, describeProfile } from '../utils/styleProfile.js'
 import {
-  analyzeEditedVideo,
-  buildProfile,
-  describeProfile,
-  listProfiles,
-  getActiveProfile,
-  setActiveProfile,
-  saveProfile,
-  renameProfile,
-  deleteProfile,
-} from '../utils/styleProfile.js'
+  createAutosave,
+  loadProject,
+  matchFiles,
+  restoreFromMatches,
+  restoreViaHandles,
+  migrateLegacyProfiles,
+  supportsFileHandles,
+  listProfilesDB,
+  saveProfileDB,
+  deleteProfileDB,
+  getActiveProfileId,
+  setActiveProfileId as persistActiveProfileId,
+} from '../utils/storage.js'
 
 const PX_PER_SEC = 26
 
 export default function Editor() {
+  // Project persistence
+  const [searchParams] = useSearchParams()
+  // A ref, not state: nothing renders it, and assigning it inside the autosave
+  // effect as state would kick off a cascading render on every save.
+  const projectIdRef = useRef(null)
+  const [projectName, setProjectName] = useState('Untitled project')
+  const [saveState, setSaveState] = useState('idle') // idle | saving | saved | error
+  const [restoreRefs, setRestoreRefs] = useState(null) // clipRefs awaiting re-selection
+  const [restoreBusy, setRestoreBusy] = useState(false)
+  const restoreInputRef = useRef(null)
+  const hydrating = useRef(false)
+  const fileHandlesRef = useRef({}) // clipId -> FileSystemFileHandle (Chrome/Edge)
+
   const [clips, setClips] = useState([])
   const [probeErrors, setProbeErrors] = useState([])
   const [selectedId, setSelectedId] = useState(null)
@@ -44,8 +61,8 @@ export default function Editor() {
   const [keepAllTakes, setKeepAllTakes] = useState(false)
 
   // Style profiles — the creator's own editing rhythm, learned from past uploads.
-  const [profiles, setProfiles] = useState(() => listProfiles())
-  const [activeProfileId, setActiveProfileId] = useState(() => getActiveProfile()?.id ?? null)
+  const [profiles, setProfiles] = useState([]) // loaded from IndexedDB on mount
+  const [activeProfileId, setActiveProfileId] = useState(null)
   const [applyStyle, setApplyStyle] = useState(true)
   const [styleAnalyzing, setStyleAnalyzing] = useState(null) // { index, total, pct, msg }
   const [styleError, setStyleError] = useState('')
@@ -135,9 +152,9 @@ export default function Editor() {
           analyses.push(a)
         }
         const profile = buildProfile(analyses, `Style ${profiles.length + 1}`)
-        saveProfile(profile)
-        setProfiles(listProfiles())
-        setActiveProfileId(getActiveProfile()?.id ?? profile.id)
+        await saveProfileDB(profile)
+        setProfiles(await listProfilesDB())
+        setActiveProfileId(persistActiveProfileId(profile.id))
       } catch (err) {
         setStyleError(err?.message || 'Could not analyze those videos.')
       } finally {
@@ -148,25 +165,25 @@ export default function Editor() {
   )
 
   const chooseProfile = useCallback((id) => {
-    setActiveProfile(id)
-    setActiveProfileId(id)
+    setActiveProfileId(persistActiveProfileId(id))
   }, [])
 
   const doRenameProfile = useCallback(
-    (id) => {
+    async (id) => {
       const current = profiles.find((p) => p.id === id)
       const next = window.prompt('Rename this style profile', current?.name || '')
-      if (next == null) return
-      renameProfile(id, next.trim())
-      setProfiles(listProfiles())
+      if (next == null || !current) return
+      await saveProfileDB({ ...current, name: next.trim() || current.name })
+      setProfiles(await listProfilesDB())
     },
     [profiles],
   )
 
-  const doDeleteProfile = useCallback((id) => {
-    deleteProfile(id)
-    setProfiles(listProfiles())
-    setActiveProfileId(getActiveProfile()?.id ?? null)
+  const doDeleteProfile = useCallback(async (id) => {
+    await deleteProfileDB(id)
+    const list = await listProfilesDB()
+    setProfiles(list)
+    setActiveProfileId(persistActiveProfileId(list[0]?.id ?? null))
   }, [])
 
   // Burn-in works on both engines: the GPU compositor draws captions on canvas,
@@ -289,14 +306,130 @@ export default function Editor() {
     }
   }, [])
 
-  const ingest = useCallback(async (fileList) => {
+  // Migrate any legacy localStorage style profiles into IndexedDB, then load
+  // from IndexedDB — the migration clears the old key, so the read must happen
+  // after it and against the new store.
+  useEffect(() => {
+    let live = true
+    ;(async () => {
+      try {
+        await migrateLegacyProfiles()
+        const list = await listProfilesDB()
+        if (!live) return
+        setProfiles(list)
+        const stored = getActiveProfileId()
+        setActiveProfileId(list.some((p) => p.id === stored) ? stored : (list[0]?.id ?? null))
+      } catch (err) {
+        console.warn('[editor] could not load style profiles:', err?.message || err)
+      }
+    })()
+    return () => {
+      live = false
+    }
+  }, [])
+
+  // ---- open a saved project -------------------------------------------
+  useEffect(() => {
+    const id = searchParams.get('project')
+    if (!id) return
+    let live = true
+    hydrating.current = true
+    ;(async () => {
+      try {
+        const loaded = await loadProject(id)
+        if (!live || !loaded) return
+        projectIdRef.current = loaded.project.id
+        setProjectName(loaded.project.name)
+        setPrompt(loaded.project.prompt || '')
+        if (loaded.project.plan) {
+          setPlan(loaded.project.plan)
+          setAiState('done')
+        }
+        const s = loaded.project.settings || {}
+        if (s.resolution) setResolution(s.resolution)
+        if (typeof s.removeFillers === 'boolean') setRemoveFillers(s.removeFillers)
+        if (typeof s.keepAllTakes === 'boolean') setKeepAllTakes(s.keepAllTakes)
+        if (s.struck) setStruck(s.struck)
+        if (s.retakeChoice) setRetakeChoice(s.retakeChoice)
+        if (typeof s.burnCaptions === 'boolean') setBurnCaptions(s.burnCaptions)
+        if (s.captionSize) setCaptionSize(s.captionSize)
+        if (s.captionPos) setCaptionPos(s.captionPos)
+        if (typeof s.captionBg === 'boolean') setCaptionBg(s.captionBg)
+        if (typeof s.applyStyle === 'boolean') setApplyStyle(s.applyStyle)
+
+        // Chrome/Edge can hand the files straight back via stored handles.
+        const viaHandles = await restoreViaHandles(loaded.clipRefs)
+        if (!live) return
+        if (viaHandles.matched.length) {
+          const r = restoreFromMatches(viaHandles.matched)
+          setClips(r.clips)
+          setAnalysis(r.analysis)
+          setTranscripts(r.transcripts)
+          setSelectedId(r.clips[0]?.id ?? null)
+        }
+        // Anything the browser could not re-open needs the user to re-select.
+        setRestoreRefs(viaHandles.missing.length ? viaHandles.missing : null)
+      } catch (err) {
+        console.warn('[editor] could not open project:', err?.message || err)
+      } finally {
+        // Let a tick pass so the hydration writes do not immediately re-save.
+        setTimeout(() => {
+          hydrating.current = false
+        }, 0)
+      }
+    })()
+    return () => {
+      live = false
+    }
+  }, [searchParams])
+
+  // ---- autosave ---------------------------------------------------------
+  const autosave = useMemo(() => createAutosave(2000, setSaveState), [])
+  useEffect(() => () => autosave.cancel(), [autosave])
+
+  // Re-select files for a reopened project and restore their work untouched.
+  const restoreFiles = useCallback(
+    (fileList) => {
+      if (!restoreRefs) return
+      setRestoreBusy(true)
+      try {
+        const { matched, missing } = matchFiles(fileList, restoreRefs)
+        if (matched.length) {
+          const r = restoreFromMatches(matched)
+          setClips((prev) => [...prev, ...r.clips])
+          setAnalysis((prev) => {
+            const next = new Map(prev)
+            for (const [k, v] of r.analysis) next.set(k, v)
+            return next
+          })
+          setTranscripts((prev) => ({ ...prev, ...r.transcripts }))
+          setSelectedId((cur) => cur || r.clips[0]?.id || null)
+        }
+        setRestoreRefs(missing.length ? missing : null)
+      } finally {
+        setRestoreBusy(false)
+      }
+    },
+    [restoreRefs],
+  )
+
+  const ingest = useCallback(async (fileList, handles) => {
     setProbing(true)
     setProbeErrors([])
     let newClips = []
+    // Handles arrive only from the File System Access picker; map them back onto
+    // clips by name+size once probing has assigned ids.
+    const handleByKey = new Map(
+      (handles || []).filter(Boolean).map((h) => [`${h.__name}::${h.__size}`, h.handle]),
+    )
     try {
       const res = await probeAll(fileList)
       newClips = res.clips
       if (newClips.length) {
+        for (const c of newClips) {
+          const h = handleByKey.get(`${c.name}::${c.size}`)
+          if (h) fileHandlesRef.current[c.id] = h
+        }
         setClips((prev) => [...prev, ...newClips])
         setSelectedId((cur) => cur || newClips[0].id)
       }
@@ -331,6 +464,32 @@ export default function Editor() {
     },
     [ingest],
   )
+
+  // Chrome/Edge: pick through the File System Access API so a handle can be
+  // stored. That is what lets a reopened project skip re-selection entirely.
+  // Everywhere else this falls back to the plain <input type=file>.
+  const pickClips = useCallback(async () => {
+    if (!supportsFileHandles) {
+      fileInputRef.current?.click()
+      return
+    }
+    try {
+      const picked = await window.showOpenFilePicker({
+        multiple: true,
+        types: [{ description: 'Video', accept: { 'video/*': ['.mp4', '.mov', '.webm', '.m4v'] } }],
+      })
+      const files = []
+      const handles = []
+      for (const handle of picked) {
+        const f = await handle.getFile()
+        files.push(f)
+        handles.push({ handle, __name: f.name, __size: f.size })
+      }
+      if (files.length) await ingest(files, handles)
+    } catch (err) {
+      if (err?.name !== 'AbortError') fileInputRef.current?.click()
+    }
+  }, [ingest])
 
   const removeClip = useCallback((id) => {
     setClips((prev) => {
@@ -625,6 +784,57 @@ export default function Editor() {
 
   const totalPlanLen = videoBlocks.reduce((a, b) => a + b.len, 0)
 
+  // ---- autosave trigger -------------------------------------------------
+  // Fires on any change worth not losing: clips, plan, transcripts, struck
+  // lines, retake picks, caption and render settings, the prompt, the name.
+  useEffect(() => {
+    if (hydrating.current) return
+    if (!clips.length && !plan) return // nothing worth a record yet
+    if (!projectIdRef.current) {
+      projectIdRef.current = `proj_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+    }
+    autosave.schedule(
+      {
+        id: projectIdRef.current,
+        name: projectName,
+        prompt,
+        plan,
+        settings: {
+          resolution,
+          removeFillers,
+          keepAllTakes,
+          struck,
+          retakeChoice,
+          burnCaptions,
+          captionSize,
+          captionPos,
+          captionBg,
+          applyStyle,
+        },
+      },
+      clips,
+      { analysis, transcripts, handles: fileHandlesRef.current },
+    )
+  }, [
+    autosave,
+    projectName,
+    prompt,
+    plan,
+    clips,
+    analysis,
+    transcripts,
+    struck,
+    retakeChoice,
+    removeFillers,
+    keepAllTakes,
+    burnCaptions,
+    captionSize,
+    captionPos,
+    captionBg,
+    applyStyle,
+    resolution,
+  ])
+
   const selTranscript = selected ? transcripts[selected.id] : null
   const selStruck = (selected && struck[selected.id]) || []
   // Plan time ranges on the selected clip — sentences overlapping these are "kept".
@@ -657,19 +867,98 @@ export default function Editor() {
     <div className="ed">
       <style>{CSS}</style>
 
+      {/* The editor is a four-pane desktop tool; a phone gets an honest message
+          rather than a layout that technically renders and cannot be used. */}
+      <div className="ed-mobile-gate">
+        <div className="ed-mobile-inner">
+          <div className="ed-empty-icon">🖥️</div>
+          <h3>ReelMind needs a desktop</h3>
+          <p>
+            The editor runs video decoding, transcription and rendering locally, in a four-panel
+            layout that does not fit a phone screen. Open this on a laptop or desktop in Chrome or
+            Edge.
+          </p>
+          <Link to="/" className="ed-btn ed-btn-primary ed-btn-block">
+            Back to the homepage
+          </Link>
+        </div>
+      </div>
+
+      {/* Reopen: the browser cannot keep file access between sessions. */}
+      {restoreRefs && (
+        <div className="ed-restore">
+          <div className="ed-restore-card">
+            <h3>Reselect your clips</h3>
+            <p className="ed-dim">
+              Browsers cannot keep access to your files between sessions. Your edit is saved —
+              reselect the same clips to continue. Transcripts, analysis and your take choices are
+              restored without redoing any of the work.
+            </p>
+            <ul className="ed-restore-list">
+              {restoreRefs.map((r) => (
+                <li key={r.id}>
+                  {r.thumb ? <img src={r.thumb} alt="" /> : <span className="ed-restore-noimg" />}
+                  <span className="ed-restore-meta">
+                    <strong>{r.name}</strong>
+                    <span className="ed-dim">
+                      {fmtTime(r.duration)} · {fmtSize(r.size)}
+                      {r.transcript ? ' · transcript saved' : ''}
+                    </span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+            <button
+              className="ed-btn ed-btn-primary ed-btn-block"
+              onClick={() => restoreInputRef.current?.click()}
+              disabled={restoreBusy}
+            >
+              {restoreBusy ? 'Matching…' : 'Choose files'}
+            </button>
+            <button className="ed-btn ed-btn-block" onClick={() => setRestoreRefs(null)}>
+              Skip — continue without them
+            </button>
+            <input
+              ref={restoreInputRef}
+              type="file"
+              multiple
+              accept="video/*"
+              hidden
+              onChange={(e) => {
+                if (e.target.files?.length) restoreFiles(e.target.files)
+                e.target.value = ''
+              }}
+            />
+          </div>
+        </div>
+      )}
+
       {/* TOP BAR */}
       <div className="ed-top">
         <Link to="/" className="ed-logo">
           Reel<span>Mind</span>
         </Link>
         <div className="ed-top-mid">
-          {plan ? plan.title : 'Untitled project'}
+          <input
+            className="ed-project-name"
+            value={projectName}
+            onChange={(e) => setProjectName(e.target.value)}
+            onBlur={(e) => setProjectName(e.target.value.trim() || 'Untitled project')}
+            aria-label="Project name"
+            spellCheck={false}
+          />
           <span className="ed-top-sub">
             {clips.length} clip{clips.length === 1 ? '' : 's'}
             {totalPlanLen > 0 && ` · ${fmtTime(totalPlanLen)} timeline`}
             {USE_MOCK && ' · mock AI'}
+            {saveState === 'saving' && ' · Saving…'}
+            {saveState === 'saved' && ' · Saved'}
+            {saveState === 'error' && ' · Not saved'}
           </span>
         </div>
+        <Link to="/projects" className="ed-btn ed-top-projects">
+          Projects
+        </Link>
         <button
           className="ed-btn ed-btn-primary"
           onClick={() => {
@@ -707,7 +996,7 @@ export default function Editor() {
                 }}
                 onDragLeave={() => setDragging(false)}
                 onDrop={onDrop}
-                onClick={() => fileInputRef.current?.click()}
+                onClick={pickClips}
                 role="button"
                 tabIndex={0}
               >
@@ -1801,6 +2090,23 @@ const CSS = `
 /* captions */
 .ed-caps { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 9px; }
 .ed-caps-head { font-weight: 600; }
+/* project persistence */
+.ed-project-name { background: none; border: 1px solid transparent; border-radius: 6px; color: var(--text); font-family: 'Syne', sans-serif; font-weight: 600; font-size: 14px; text-align: center; padding: 2px 8px; width: 260px; max-width: 40vw; }
+.ed-project-name:hover { border-color: var(--border); }
+.ed-project-name:focus { outline: none; border-color: var(--purple); background: var(--bg); }
+.ed-top-projects { padding: 7px 13px; font-size: 12.5px; }
+
+.ed-restore { position: fixed; inset: 0; z-index: 60; background: rgba(5,5,10,.86); backdrop-filter: blur(6px); display: grid; place-items: center; padding: 24px; }
+.ed-restore-card { width: min(520px, 100%); max-height: 84vh; overflow-y: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 22px; display: flex; flex-direction: column; gap: 10px; }
+.ed-restore-card h3 { font-size: 19px; }
+.ed-restore-list { list-style: none; margin: 6px 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.ed-restore-list li { display: flex; gap: 10px; align-items: center; padding: 8px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.ed-restore-list img, .ed-restore-noimg { width: 62px; height: 36px; border-radius: 6px; object-fit: cover; background: #000; flex: none; }
+.ed-restore-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ed-restore-meta strong { font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.ed-mobile-gate { display: none; }
+
 /* style profiles */
 .ed-style-lead { font-size: 13px; font-weight: 600; color: var(--text); margin: 0 0 8px; }
 .ed-style-progress { display: flex; flex-direction: column; gap: 4px; }
@@ -1869,9 +2175,13 @@ const CSS = `
 @media (max-width: 1080px) {
   .ed-side { width: 200px; }
 }
+/* Below tablet the editor is not usable, so replace it outright rather than
+   letting a four-pane layout stack into something broken. */
 @media (max-width: 860px) {
-  .ed { position: static; min-height: 100vh; }
-  .ed-body { flex-direction: column; }
-  .ed-side { width: 100%; }
+  .ed-top, .ed-body, .ed-restore { display: none !important; }
+  .ed-mobile-gate { display: grid; place-items: center; position: fixed; inset: 0; padding: 28px; background: var(--bg); }
+  .ed-mobile-inner { max-width: 380px; text-align: center; }
+  .ed-mobile-inner h3 { margin: 14px 0 10px; font-size: 22px; }
+  .ed-mobile-inner p { color: var(--muted); font-size: 14px; line-height: 1.65; margin-bottom: 20px; }
 }
 `

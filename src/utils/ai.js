@@ -3,7 +3,11 @@
 import { findRetakes, extendTakeRange } from './retakes.js'
 import { applyProfile, describePacing } from './styleProfile.js'
 
+// ⇩⇩⇩ FLIP THIS TO false TO GO LIVE ⇩⇩⇩
+// Requires ANTHROPIC_API_KEY set in the deployment environment (see api/plan.js).
+// Nothing spends money while this is true.
 export const USE_MOCK = true
+// ⇧⇧⇧ FLIP THIS TO false TO GO LIVE ⇧⇧⇧
 
 /**
  * Build the Claude prompt string. Lists the clip inventory as JSON, states the
@@ -403,16 +407,27 @@ export async function generateEditPlan(clips, userPrompt, analysis, transcripts,
     return styleOn ? applyProfile(plan, profile, ctx) : plan
   }
 
+  // Deliberately slim: buildPrompt has already embedded the sentences and clip
+  // inventory the model needs, so re-sending raw transcripts would double the
+  // payload for no gain and trip the endpoint's 200KB guard on real projects.
+  // api/plan.js accepts the fuller shape so buildPrompt can move server-side
+  // later without a contract change.
   const res = await fetch('/api/plan', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       prompt: buildPrompt(clips, userPrompt, transcripts, styleOn ? profile : null),
+      clips: clips.map((c) => ({ name: c.name, duration: c.duration, width: c.width, height: c.height })),
+      profile: styleOn ? profile : null,
     }),
   })
-  if (!res.ok) throw new Error(`Planning service failed (${res.status}).`)
-  const data = await res.json()
-  const raw = typeof data === 'string' ? data : data.text || ''
+
+  const data = await res.json().catch(() => null)
+  if (!res.ok) {
+    // The endpoint returns { error: { code, message } } — show the message.
+    throw new Error(data?.error?.message || `Planning service failed (${res.status}).`)
+  }
+  const raw = typeof data === 'string' ? data : data?.text || ''
   let parsed
   try {
     parsed = JSON.parse(stripFences(raw))

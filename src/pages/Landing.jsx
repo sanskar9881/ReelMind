@@ -53,6 +53,9 @@ export default function Landing() {
             <a href="#features">Features</a>
             <a href="#pricing">Pricing</a>
           </div>
+          <Link to="/projects" className="lp-btn lp-btn-ghost lp-btn-sm">
+            Projects
+          </Link>
           <Link to="/editor" className="lp-btn lp-btn-sm">
             Open editor
           </Link>
@@ -77,7 +80,7 @@ export default function Landing() {
           </p>
           <div className="lp-cta-row">
             <Link to="/editor" className="lp-btn lp-btn-lg">
-              Start editing — free
+              Try in Browser
             </Link>
             <a href="#how" className="lp-btn lp-btn-ghost lp-btn-lg">
               See how it works
@@ -187,7 +190,7 @@ const CSS = `
 .lp-nav-inner { display: flex; align-items: center; gap: 24px; height: 68px; }
 .lp-logo { font-family: 'Syne', sans-serif; font-weight: 800; font-size: 20px; letter-spacing: -.03em; }
 .lp-logo span { background: linear-gradient(90deg, var(--cyan), var(--purple)); -webkit-background-clip: text; background-clip: text; color: transparent; }
-.lp-nav-links { display: flex; gap: 26px; margin-left: auto; font-size: 14px; color: var(--muted); }
+.lp-nav-links { display: flex; gap: 26px; margin-left: auto; margin-right: 8px; font-size: 14px; color: var(--muted); }
 .lp-nav-links a:hover { color: var(--text); }
 
 .lp-btn { display: inline-flex; align-items: center; justify-content: center; border-radius: 10px; font-weight: 600; font-size: 14px; padding: 10px 18px; border: 1px solid transparent; background: linear-gradient(90deg, var(--cyan), var(--purple)); color: #05050a; transition: transform .15s, box-shadow .15s, background .15s; white-space: nowrap; }

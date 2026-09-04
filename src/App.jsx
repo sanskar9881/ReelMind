@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import Landing from './pages/Landing.jsx'
 import Editor from './pages/Editor.jsx'
+import Projects from './pages/Projects.jsx'
 
 export default function App() {
   return (
@@ -8,6 +9,7 @@ export default function App() {
       <Routes>
         <Route path="/" element={<Landing />} />
         <Route path="/editor" element={<Editor />} />
+        <Route path="/projects" element={<Projects />} />
       </Routes>
     </BrowserRouter>
   )

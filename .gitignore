@@ -22,3 +22,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Secrets — ANTHROPIC_API_KEY belongs in the Vercel dashboard, never in the repo
+.env
+.env.*
+!.env.example
+.vercel

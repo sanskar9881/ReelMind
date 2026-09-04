@@ -12,7 +12,7 @@ Browser-based AI vlog editor. Vite + React. No backend yet.
 - src/utils/videoProcessor.js — render(): WebCodecs (GPU) path with FFmpeg.wasm fallback; renderVideo() is the FFmpeg two-pass; estimateRenderSeconds(); coalesceRanges() + countCuts()
 - src/utils/audioSplice.js — cut hygiene: SPLICE_MS, applyEdgeFades (equal-power), concatWithSplice, findZeroCrossing. For butt-joined audio, NOT crossfades
 - src/utils/captions.js — buildCaptions(transcript) → cues from word timings; remapToOutputTimeline(cuesByClip, plan) → output-time cues (handles reorder + excludeRanges); toSRT/toVTT
-- src/utils/styleProfile.js — learns editing rhythm from the creator's own finished uploads: analyzeEditedVideo (4fps luma diffing, cuts found against a ROLLING MEDIAN not a fixed threshold), buildProfile, applyProfile, localStorage persistence. Hard cuts are IMPULSES (dominant local peak), crossfades are PLATEAUS — that distinction is what keeps transitionRatio honest
+- src/utils/styleProfile.js — learns editing rhythm from the creator's own finished uploads: analyzeEditedVideo (4fps luma diffing, cuts found against a ROLLING MEDIAN not a fixed threshold), buildProfile, applyProfile. Profiles now live in IndexedDB (migrated out of localStorage on first run). Hard cuts are IMPULSES (dominant local peak), crossfades are PLATEAUS — that distinction is what keeps transitionRatio honest
 - The two engines JOIN differently: WebCodecs crossfades (timeline SHORTER by 0.5s per non-cut boundary), FFmpeg concat-demuxes (no xfade, every boundary a hard cut). resolveJoinPath(plan, engine) is the single source of truth — caption remap AND countCuts' totalDuration both read it, so they can't disagree with what renders. A 3-fade plan is 3.2s on WebCodecs vs 4.2s on FFmpeg
 - @ffmpeg/core@0.12.6 DOES ship libass; it has no fontconfig, so burn-in needs a TTF written to the FS and `fontsdir=` passed to the subtitles filter. ffmpeg.exec returns 0 even when the filter drew nothing — trust the log (`fontselect:`), never the exit code
 - The ~85ms WebCodecs container overshoot is AAC-priming timebase, NOT transition-offset math: renderer's own "[renderer] timeline" debug shows video & audio tracks land dead-on the plan; both shift equally so A/V sync = 0. Left alone deliberately (see smoke test cut-only run)
@@ -24,6 +24,9 @@ Browser-based AI vlog editor. Vite + React. No backend yet.
 - src/utils/verify.js — verifyRender(blobUrl, {totalDuration,width,height}) + measureSync(). Post-render harness: duration, resolution, seekable, non-uniform frame, audio present/non-silent
 - src/utils/smokeTest.js — dev-only runSmokeTest(): canvas+MediaRecorder test clips → full pipeline → verifyRender, run once per forced engine. Reports the container MediaRecorder actually produced (WebM ⇒ WebCodecs untestable, mp4box can't demux it)
 - render() opts.forceEngine ('webcodecs'|'ffmpeg') bypasses the capability check; a forced 'webcodecs' failure is THROWN, not silently fallen back
+
+- src/utils/storage.js — IndexedDB project persistence (projects / clipRefs / profiles). A File CANNOT be persisted across sessions: store metadata+analysis+transcript+plan, then match re-selected files by name+size and restore without recomputing. FileSystemFileHandle path (Chrome/Edge) skips re-selection; feature-detected
+- api/plan.js — the ONLY place ANTHROPIC_API_KEY exists. Never VITE_-prefixed (Vite inlines VITE_* into the client bundle). vite.config.js secretGuard fails the build on a VITE_*SECRET-ish var or an sk-ant- literal in the bundle
 
 ## Rules
 - Never use dangerouslyAllowBrowser. Real Claude calls go through /api/plan
@@ -42,3 +45,4 @@ Browser-based AI vlog editor. Vite + React. No backend yet.
 - Every render is auto-verified (verifyRender + measureSync). A "real render confirmed correct" bar, not "looks done"
 - Palette: bg #05050A, panels #0B0B14, cyan #09F6FF, purple #9B5DFF, muted #6464A0
 - Fonts: Syne (headings), DM Sans (body)
+- USE_MOCK in src/utils/ai.js is still true — flipping that one line is the only step to go live
