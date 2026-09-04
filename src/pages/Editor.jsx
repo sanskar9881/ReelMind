@@ -136,40 +136,36 @@ export default function Editor() {
 
   const hasCaptions = Object.keys(captionCuesByClip).length > 0
 
+  const activeProfile = useMemo(
+    () => profiles.find((p) => p.id === activeProfileId) || null,
+    [profiles, activeProfileId],
+  )
+
   // Dev-only: exactly what buildPrompt would send for this project, so the real
   // token cost is a known number before USE_MOCK is ever flipped.
+  // Must stay AFTER activeProfile — a useMemo body runs during render, so
+  // reading a later-declared const here is a TDZ crash, not a lint nit.
   const promptStats = useMemo(() => {
     if (!import.meta.env.DEV || !clips.length) return null
     try {
-      const text = buildPrompt(
-        clips,
-        prompt,
-        transcriptsMap,
-        applyStyle ? activeProfile : null,
-      )
+      const text = buildPrompt(clips, prompt, transcriptsMap, applyStyle ? activeProfile : null)
       const bytes = new TextEncoder().encode(text).length
       const totalSentences = Object.values(transcripts).reduce(
         (a, t) => a + (t?.sentences?.length || 0),
         0,
       )
-      const sentInPrompt = (text.match(/"text":/g) || []).length
       return {
         bytes,
         kb: bytes / 1024,
         tokens: Math.round(text.length / 3.6), // chars/3.6 ≈ Claude tokens
         sampled: /"sentencesSampled": true/.test(text),
-        sentInPrompt,
+        sentInPrompt: (text.match(/"text":/g) || []).length,
         totalSentences,
       }
     } catch {
       return null
     }
   }, [clips, prompt, transcriptsMap, transcripts, applyStyle, activeProfile])
-
-  const activeProfile = useMemo(
-    () => profiles.find((p) => p.id === activeProfileId) || null,
-    [profiles, activeProfileId],
-  )
 
   // Analyze 1-5 finished past uploads into a profile.
   const ingestStyleVideos = useCallback(
@@ -328,17 +324,21 @@ export default function Editor() {
     recordCorrection(ctx.planId, { field, segmentIndex, before, after }, ctx).catch(() => {})
   }, [])
 
+  // NOTE for all correction-logging handlers below: the logging happens OUTSIDE
+  // the state updater. React can invoke an updater more than once (StrictMode
+  // does), and a side effect inside one double-counts corrections — which would
+  // silently corrupt the exact metric this instrumentation exists to produce.
   const chooseTake = useCallback(
     (clipId, groupId, sentenceIndex) => {
-      setRetakeChoice((prev) => {
-        const before = prev[clipId]?.[groupId]
-        if (before !== sentenceIndex) {
-          logCorrection('retakeChoice', null, before ?? 'recommended', sentenceIndex)
-        }
-        return { ...prev, [clipId]: { ...(prev[clipId] || {}), [groupId]: sentenceIndex } }
+      const before = retakeChoice[clipId]?.[groupId]
+      if (before === sentenceIndex) return
+      logCorrection('retakeChoice', null, before ?? 'recommended', sentenceIndex)
+      setRetakeChoice({
+        ...retakeChoice,
+        [clipId]: { ...(retakeChoice[clipId] || {}), [groupId]: sentenceIndex },
       })
     },
-    [logCorrection],
+    [retakeChoice, logCorrection],
   )
 
   // Decorate a fresh plan with the current text-editing decisions.
@@ -678,14 +678,12 @@ export default function Editor() {
 
   const toggleStruck = useCallback(
     (clipId, idx) => {
-      setStruck((prev) => {
-        const cur = prev[clipId] || []
-        const has = cur.includes(idx)
-        logCorrection(has ? 'lineRestored' : 'lineStruck', null, idx, has ? 'kept' : 'excluded')
-        return { ...prev, [clipId]: has ? cur.filter((i) => i !== idx) : [...cur, idx] }
-      })
+      const cur = struck[clipId] || []
+      const has = cur.includes(idx)
+      logCorrection(has ? 'lineRestored' : 'lineStruck', null, idx, has ? 'kept' : 'excluded')
+      setStruck({ ...struck, [clipId]: has ? cur.filter((i) => i !== idx) : [...cur, idx] })
     },
-    [logCorrection],
+    [struck, logCorrection],
   )
 
   // ---- AI plan -----------------------------------------------------------
@@ -738,34 +736,32 @@ export default function Editor() {
   // Trim or drop a shot from the generated plan, recording each change.
   const adjustSegment = useCallback(
     (index, field, deltaSec) => {
-      setPlan((prev) => {
-        if (!prev?.segments?.[index]) return prev
-        const segs = prev.segments.map((s) => ({ ...s }))
-        const s = segs[index]
-        const before = s[field]
-        const next =
-          field === 'start'
-            ? Math.max(0, Math.min(s.end - 0.7, before + deltaSec))
-            : Math.max(s.start + 0.7, before + deltaSec)
-        if (Math.abs(next - before) < 0.01) return prev
-        s[field] = +next.toFixed(3)
-        logCorrection(field, index, +before.toFixed(3), s[field])
-        return { ...prev, segments: segs }
-      })
+      const seg = plan?.segments?.[index]
+      if (!seg) return
+      const clip = clips.find((c) => c.id === seg.clipId)
+      const before = seg[field]
+      const next =
+        field === 'start'
+          ? Math.max(0, Math.min(seg.end - 0.7, before + deltaSec))
+          : Math.min(clip?.duration ?? Infinity, Math.max(seg.start + 0.7, before + deltaSec))
+      if (Math.abs(next - before) < 0.01) return // clamped to a no-op — not a correction
+      const segs = plan.segments.map((s, i) =>
+        i === index ? { ...s, [field]: +next.toFixed(3) } : { ...s },
+      )
+      logCorrection(field, index, +before.toFixed(3), +next.toFixed(3))
+      setPlan({ ...plan, segments: segs })
     },
-    [logCorrection],
+    [plan, clips, logCorrection],
   )
 
   const dropSegment = useCallback(
     (index) => {
-      setPlan((prev) => {
-        if (!prev?.segments?.[index]) return prev
-        const removed = prev.segments[index]
-        logCorrection('removed', index, `${removed.clip} ${removed.start}–${removed.end}`, null)
-        return { ...prev, segments: prev.segments.filter((_, i) => i !== index) }
-      })
+      const removed = plan?.segments?.[index]
+      if (!removed) return
+      logCorrection('removed', index, `${removed.clip} ${removed.start}–${removed.end}`, null)
+      setPlan({ ...plan, segments: plan.segments.filter((_, i) => i !== index) })
     },
-    [logCorrection],
+    [plan, logCorrection],
   )
 
   // ---- render -----------------------------------------------------------
@@ -1831,7 +1827,7 @@ export default function Editor() {
             <div className="ed-side-scroll ed-placeholder">
               {plan ? (
                 <>
-                  <p className="ed-dim">Plan segments</p>
+                  <p className="ed-dim">Plan segments — trim or drop a shot to fix the edit.</p>
                   {plan.segments.map((s, i) => (
                     <div key={i} className="ed-seg">
                       <div className="ed-seg-top">
@@ -1840,6 +1836,21 @@ export default function Editor() {
                       </div>
                       <div className="ed-seg-sub">
                         {s.start.toFixed(1)}s – {s.end.toFixed(1)}s · {(s.end - s.start).toFixed(1)}s · {s.transition}
+                      </div>
+                      <div className="ed-seg-ctl">
+                        <span className="ed-dim">in</span>
+                        <button onClick={() => adjustSegment(i, 'start', -0.5)} title="Start 0.5s earlier">−</button>
+                        <button onClick={() => adjustSegment(i, 'start', 0.5)} title="Start 0.5s later">+</button>
+                        <span className="ed-dim">out</span>
+                        <button onClick={() => adjustSegment(i, 'end', -0.5)} title="End 0.5s earlier">−</button>
+                        <button onClick={() => adjustSegment(i, 'end', 0.5)} title="End 0.5s later">+</button>
+                        <button
+                          className="ed-seg-drop"
+                          onClick={() => dropSegment(i)}
+                          title="Remove this shot from the edit"
+                        >
+                          ×
+                        </button>
                       </div>
                     </div>
                   ))}
@@ -2047,6 +2058,91 @@ export default function Editor() {
                   >
                     Download MP4
                   </a>
+
+                  {/* Edit-quality signal. Local only — nothing leaves the browser. */}
+                  {plan?.planId && (
+                    <div className="ed-rate">
+                      {rating ? (
+                        <span className="ed-dim">
+                          Thanks — logged as “{rating}”. It stays on this machine.
+                        </span>
+                      ) : (
+                        <>
+                          <span>How was this edit?</span>
+                          <div className="ed-rate-row">
+                            {[
+                              ['good', 'Good'],
+                              ['needs-work', 'Needs work'],
+                              ['unusable', 'Unusable'],
+                            ].map(([v, label]) => (
+                              <button key={v} className="ed-btn ed-btn-sm" onClick={() => rateEdit(v)}>
+                                {label}
+                              </button>
+                            ))}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {import.meta.env.DEV && (
+                <button
+                  className="ed-btn ed-btn-block ed-mt"
+                  onClick={async () => setQualityView(qualityView ? null : await listFeedback())}
+                >
+                  {qualityView ? 'Hide edit quality' : 'Edit quality'}
+                </button>
+              )}
+
+              {import.meta.env.DEV && qualityView && (
+                <div className="ed-quality">
+                  {!qualityView.length ? (
+                    <div className="ed-dim">
+                      No rated edits yet. Generate a plan, render it, and answer “How was this
+                      edit?”.
+                    </div>
+                  ) : (
+                    <>
+                      <div className="ed-quality-sum">
+                        {qualityView.filter((f) => f.rating).length} rated ·{' '}
+                        {(
+                          qualityView.reduce((a, f) => a + (f.corrections?.length || 0), 0) /
+                          Math.max(1, qualityView.length)
+                        ).toFixed(1)}{' '}
+                        corrections per edit
+                      </div>
+                      {qualityView.map((f) => (
+                        <div key={f.planId} className="ed-quality-row">
+                          <div className="ed-quality-top">
+                            <span className={`ed-quality-dot r-${f.rating || 'none'}`} />
+                            <strong>{f.rating || 'unrated'}</strong>
+                            <span className="ed-dim">
+                              {f.corrections?.length || 0} correction
+                              {(f.corrections?.length || 0) === 1 ? '' : 's'}
+                            </span>
+                          </div>
+                          <div className="ed-dim ed-quality-meta">
+                            “{f.prompt || '(no prompt)'}” · {f.segmentCount ?? '?'} shots ·{' '}
+                            {f.profileName ? `style: ${f.profileName}` : 'no style'} ·{' '}
+                            {f.engine || 'not rendered'}
+                            {f.usedMock ? ' · mock' : ''}
+                          </div>
+                          {!!f.corrections?.length && (
+                            <div className="ed-quality-fixes">
+                              {f.corrections.slice(-6).map((c, i) => (
+                                <span key={i}>
+                                  {c.field}
+                                  {c.segmentIndex != null ? ` #${c.segmentIndex}` : ''}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </>
+                  )}
                 </div>
               )}
             </div>
@@ -2232,6 +2328,36 @@ const CSS = `
 /* captions */
 .ed-caps { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 9px; }
 .ed-caps-head { font-weight: 600; }
+/* prompt size + edit-quality signal (both dev-only) */
+.ed-promptsize { margin-top: 10px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); }
+.ed-promptsize.is-over { border-color: var(--pink); }
+.ed-promptsize-head { font-size: 11.5px; font-weight: 600; color: var(--cyan); margin-bottom: 3px; font-variant-numeric: tabular-nums; }
+.ed-promptsize.is-over .ed-promptsize-head { color: var(--pink); }
+
+.ed-rate { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); font-size: 12px; display: flex; flex-direction: column; gap: 8px; }
+.ed-rate-row { display: flex; gap: 6px; }
+.ed-rate-row .ed-btn { flex: 1; padding: 6px 4px; }
+
+.ed-quality { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; max-height: 300px; overflow-y: auto; }
+.ed-quality-sum { font-size: 11.5px; font-weight: 600; color: var(--cyan); font-variant-numeric: tabular-nums; }
+.ed-quality-row { border: 1px solid var(--border); border-radius: 8px; padding: 8px; background: var(--surface); }
+.ed-quality-top { display: flex; align-items: center; gap: 6px; font-size: 11.5px; }
+.ed-quality-top strong { text-transform: capitalize; }
+.ed-quality-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--muted); }
+.ed-quality-dot.r-good { background: #7CFFB2; }
+.ed-quality-dot.r-needs-work { background: #ffcf8a; }
+.ed-quality-dot.r-unusable { background: var(--pink); }
+.ed-quality-meta { margin-top: 3px; line-height: 1.5; }
+.ed-quality-fixes { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.ed-quality-fixes span { font-size: 9.5px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+
+.ed-seg-ctl { display: flex; align-items: center; gap: 4px; margin-top: 7px; }
+.ed-seg-ctl > .ed-dim { font-size: 9.5px; text-transform: uppercase; letter-spacing: .05em; }
+.ed-seg-ctl button { width: 20px; height: 20px; border-radius: 5px; border: 1px solid var(--border); background: var(--bg); color: var(--muted); font-size: 12px; line-height: 1; }
+.ed-seg-ctl button:hover { border-color: var(--cyan); color: var(--cyan); }
+.ed-seg-drop { margin-left: auto; }
+.ed-seg-drop:hover { border-color: var(--pink) !important; color: var(--pink) !important; }
+
 /* project persistence */
 .ed-project-name { background: none; border: 1px solid transparent; border-radius: 6px; color: var(--text); font-family: 'Syne', sans-serif; font-weight: 600; font-size: 14px; text-align: center; padding: 2px 8px; width: 260px; max-width: 40vw; }
 .ed-project-name:hover { border-color: var(--border); }

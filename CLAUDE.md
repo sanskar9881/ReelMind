@@ -46,3 +46,5 @@ Browser-based AI vlog editor. Vite + React. No backend yet.
 - Palette: bg #05050A, panels #0B0B14, cyan #09F6FF, purple #9B5DFF, muted #6464A0
 - Fonts: Syne (headings), DM Sans (body)
 - USE_MOCK in src/utils/ai.js is still true — flipping that one line is the only step to go live
+- buildPrompt samples sentences for clips over 3 min (first/last 15 + every 3rd, flagged as "sentencesSampled" with a rule telling the model gaps are unshown speech, not silence). Replaced a slice(0,40) that silently showed only the opening 10% of a 30-min clip. Measured: 2h of footage = 81KB / ~23k tokens
+- Edit-quality signal is local-only (IndexedDB `feedback` store): rating + corrections per plan. Correction logging must stay OUTSIDE state updaters — React can invoke an updater twice and double-count the exact metric this exists to produce
