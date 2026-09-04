@@ -27,10 +27,30 @@ import {
   recordCorrection,
   listFeedback,
 } from '../utils/storage.js'
+import { useLayoutMode } from '../ui/useResponsive.js'
+import { useToast } from '../ui/Toast.jsx'
+import { EmptyState, SkeletonRows } from '../ui/Empty.jsx'
+import { ConfirmButton } from '../ui/Confirm.jsx'
+import { RenderProgress } from '../ui/RenderProgress.jsx'
 
 const PX_PER_SEC = 26
 
+/** Left-hand panels, in tab order. In single-panel mode Export joins them. */
+const LEFT_TABS = ['clips', 'transcript', 'style', 'music', 'fx']
+const MOBILE_TABS = ['clips', 'transcript', 'style', 'export']
+const TAB_ICON = { clips: '🎞', transcript: '💬', style: '✦', music: '♪', fx: '✧', edit: '✂', grade: '◑', export: '⬇' }
+const TAB_LABEL = { fx: 'FX', edit: 'Edit', grade: 'Grade', export: 'Export' }
+const tabLabel = (t) => TAB_LABEL[t] || t[0].toUpperCase() + t.slice(1)
+
 export default function Editor() {
+  const toast = useToast()
+  const { mode } = useLayoutMode() // 'full' | 'rail' | 'single'
+
+  // Layout state that only exists below 1280px.
+  const [railOpen, setRailOpen] = useState(false) // right panel slid over the stage
+  const [sheetOpen, setSheetOpen] = useState(false) // timeline expanded into a sheet
+  const [tlFocus, setTlFocus] = useState(0) // keyboard cursor within the timeline
+
   // Project persistence
   const [searchParams] = useSearchParams()
   // A ref, not state: nothing renders it, and assigning it inside the autosave
@@ -89,6 +109,7 @@ export default function Editor() {
   const [resolution, setResolution] = useState('720p')
   const [rendering, setRendering] = useState(false)
   const [progress, setProgress] = useState({ stage: '', pct: 0, msg: '' })
+  const [renderStartedAt, setRenderStartedAt] = useState(null)
   const [result, setResult] = useState(null) // { url, size, method, fellBack, ... }
   const [renderError, setRenderError] = useState('')
   const [engine, setEngine] = useState(null) // checkWebCodecsSupport() result
@@ -188,13 +209,15 @@ export default function Editor() {
         await saveProfileDB(profile)
         setProfiles(await listProfilesDB())
         setActiveProfileId(persistActiveProfileId(profile.id))
+        toast.success('Style profile built', `From ${files.length} video${files.length === 1 ? '' : 's'}`)
       } catch (err) {
         setStyleError(err?.message || 'Could not analyze those videos.')
+        toast.error('Style analysis failed', err?.message)
       } finally {
         setStyleAnalyzing(null)
       }
     },
-    [profiles.length],
+    [profiles.length, toast],
   )
 
   const chooseProfile = useCallback((id) => {
@@ -212,12 +235,17 @@ export default function Editor() {
     [profiles],
   )
 
-  const doDeleteProfile = useCallback(async (id) => {
-    await deleteProfileDB(id)
-    const list = await listProfilesDB()
-    setProfiles(list)
-    setActiveProfileId(persistActiveProfileId(list[0]?.id ?? null))
-  }, [])
+  const doDeleteProfile = useCallback(
+    async (id) => {
+      const gone = profiles.find((p) => p.id === id)
+      await deleteProfileDB(id)
+      const list = await listProfilesDB()
+      setProfiles(list)
+      setActiveProfileId(persistActiveProfileId(list[0]?.id ?? null))
+      toast.info(`Deleted “${gone?.name || 'profile'}”`)
+    },
+    [profiles, toast],
+  )
 
   // Burn-in works on both engines: the GPU compositor draws captions on canvas,
   // and the FFmpeg core does ship libass (it just needs a font handed to it).
@@ -450,7 +478,16 @@ export default function Editor() {
   }, [searchParams])
 
   // ---- autosave ---------------------------------------------------------
-  const autosave = useMemo(() => createAutosave(2000, setSaveState), [])
+  // Only a failed save is worth a toast — a successful one already shows in the
+  // top bar, and a toast on every keystroke's save would be noise.
+  const onSaveState = useCallback(
+    (st) => {
+      setSaveState(st)
+      if (st === 'error') toast.error('Project not saved', 'Browser storage rejected the write.')
+    },
+    [toast],
+  )
+  const autosave = useMemo(() => createAutosave(2000, onSaveState), [onSaveState])
   useEffect(() => () => autosave.cancel(), [autosave])
 
   // Re-select files for a reopened project and restore their work untouched.
@@ -499,7 +536,13 @@ export default function Editor() {
         setClips((prev) => [...prev, ...newClips])
         setSelectedId((cur) => cur || newClips[0].id)
       }
-      if (res.errors.length) setProbeErrors(res.errors)
+      if (res.errors.length) {
+        setProbeErrors(res.errors)
+        toast.error(
+          `${res.errors.length} file${res.errors.length === 1 ? '' : 's'} could not be read`,
+          res.errors[0].message,
+        )
+      }
     } finally {
       setProbing(false)
     }
@@ -515,12 +558,16 @@ export default function Editor() {
           for (const [k, v] of map) merged.set(k, v)
           return merged
         })
+        toast.success(
+          `Analysis finished · ${newClips.length} clip${newClips.length === 1 ? '' : 's'}`,
+          'Audio energy, motion and silences are ready for the planner.',
+        )
       } finally {
         setAnalyzing(false)
         setAnalyzeMsg('')
       }
     }
-  }, [])
+  }, [toast])
 
   const onDrop = useCallback(
     (e) => {
@@ -641,16 +688,18 @@ export default function Editor() {
           setTranscribing({ clipId: clip.id, pct: p.pct, msg: p.msg }),
         )
         mergeTranscript(clip, res)
+        toast.success(`Transcribed ${clip.name}`, `${res.sentences.length} sentences`)
       } catch (err) {
         setTranscripts((prev) => ({
           ...prev,
           [clip.id]: { error: err.message, name: clip.name, words: [], sentences: [], fillers: [], text: '' },
         }))
+        toast.error(`Could not transcribe ${clip.name}`, err.message)
       } finally {
         setTranscribing(null)
       }
     },
-    [transcribing, mergeTranscript],
+    [transcribing, mergeTranscript, toast],
   )
 
   const transcribeAllClips = useCallback(async () => {
@@ -674,7 +723,8 @@ export default function Editor() {
       }
     }
     setTranscribing(null)
-  }, [transcribing, clips, transcripts, mergeTranscript])
+    toast.success(`Transcribed ${pending.length} clip${pending.length === 1 ? '' : 's'}`)
+  }, [transcribing, clips, transcripts, mergeTranscript, toast])
 
   const toggleStruck = useCallback(
     (clipId, idx) => {
@@ -787,6 +837,7 @@ export default function Editor() {
     setRenderError('')
     setResult(null)
     setVerifyState(null)
+    setRenderStartedAt(Date.now())
     setProgress({ stage: 'engine', pct: 0, msg: 'Preparing…' })
     try {
       const base =
@@ -819,6 +870,7 @@ export default function Editor() {
         (p) => setProgress(p),
       )
       setResult(out)
+      toast.success('Render complete', `${fmtSize(out.size)} · ${out.method === 'webcodecs' ? 'GPU' : 'software'}`)
 
       // Every render is verified — no "looks done" without a check.
       setVerifyState({ running: true, report: null, sync: null })
@@ -831,10 +883,12 @@ export default function Editor() {
       }
     } catch (err) {
       setRenderError(err.message || 'Render failed.')
+      toast.error('Render failed', err.message)
     } finally {
       setRendering(false)
     }
   }, [
+    toast,
     rendering,
     clips,
     plan,
@@ -896,13 +950,24 @@ export default function Editor() {
     if (plan?.segments?.length) {
       return plan.segments.map((s, i) => ({
         key: `seg_${i}`,
+        index: i,
+        clipId: s.clipId,
         name: s.clip,
         len: s.end - s.start,
+        start: s.start,
         role: s.role,
         transition: s.transition,
       }))
     }
-    return clips.map((c) => ({ key: c.id, name: c.name, len: c.duration, role: 'clip' }))
+    return clips.map((c, i) => ({
+      key: c.id,
+      index: i,
+      clipId: c.id,
+      name: c.name,
+      len: c.duration,
+      start: 0,
+      role: 'clip',
+    }))
   }, [plan, clips])
 
   const totalPlanLen = videoBlocks.reduce((a, b) => a + b.len, 0)
@@ -958,6 +1023,77 @@ export default function Editor() {
     resolution,
   ])
 
+  // ---- layout mode -------------------------------------------------------
+  // Derived, not stored: a resize must not leave a panel floating over a
+  // layout that no longer has anywhere to put it.
+  const singleMode = mode === 'single'
+  const railMode = mode === 'rail'
+  const rightOverlayOpen = railMode && railOpen
+  const timelineSheet = singleMode && sheetOpen
+  // 'export' is a left tab only when there is a single panel to put it in.
+  const activeLeftTab = !singleMode && leftTab === 'export' ? 'clips' : leftTab
+  const showLeftPanel = !singleMode || activeLeftTab !== 'export'
+  const showRightPanel = singleMode ? activeLeftTab === 'export' : true
+
+  // ---- timeline keyboard access -----------------------------------------
+  // The lane is a listbox: arrows move the cursor, Enter selects the shot
+  // (seeking the preview to it), Delete removes it from the edit.
+  const tlRef = useRef(null)
+  const focusedBlock = videoBlocks[Math.min(tlFocus, videoBlocks.length - 1)] || null
+
+  const selectBlock = useCallback(
+    (b) => {
+      if (!b) return
+      if (b.clipId) setSelectedId(b.clipId)
+      // Seeking has to wait for the <video> to swap sources when the clip changed.
+      const t = b.start || 0
+      requestAnimationFrame(() => seekPreview(t))
+    },
+    [seekPreview],
+  )
+
+  const removeBlock = useCallback(
+    (b) => {
+      if (!b) return
+      if (plan?.segments?.length && typeof b.index === 'number') dropSegment(b.index)
+      else if (b.clipId) removeClip(b.clipId)
+    },
+    [plan, dropSegment, removeClip],
+  )
+
+  const onTimelineKey = useCallback(
+    (e) => {
+      if (!videoBlocks.length) return
+      const last = videoBlocks.length - 1
+      let next = null
+      if (e.key === 'ArrowRight' || e.key === 'ArrowDown') next = Math.min(last, tlFocus + 1)
+      else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') next = Math.max(0, tlFocus - 1)
+      else if (e.key === 'Home') next = 0
+      else if (e.key === 'End') next = last
+      else if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault()
+        selectBlock(videoBlocks[Math.min(tlFocus, last)])
+        return
+      } else if (e.key === 'Delete' || e.key === 'Backspace') {
+        e.preventDefault()
+        const b = videoBlocks[Math.min(tlFocus, last)]
+        removeBlock(b)
+        setTlFocus((i) => Math.max(0, Math.min(i, videoBlocks.length - 2)))
+        toast.info('Shot removed from the edit')
+        return
+      } else return
+
+      e.preventDefault()
+      setTlFocus(next)
+      // Keep the cursor in view — the lane scrolls horizontally.
+      tlRef.current?.querySelector(`[data-tl-index="${next}"]`)?.scrollIntoView({
+        block: 'nearest',
+        inline: 'nearest',
+      })
+    },
+    [videoBlocks, tlFocus, selectBlock, removeBlock, toast],
+  )
+
   const selTranscript = selected ? transcripts[selected.id] : null
   const selStruck = (selected && struck[selected.id]) || []
   // Plan time ranges on the selected clip — sentences overlapping these are "kept".
@@ -986,32 +1122,91 @@ export default function Editor() {
     return { byFirst, members }
   }, [selRetakes])
 
-  return (
-    <div className="ed">
-      <style>{CSS}</style>
-
-      {/* The editor is a four-pane desktop tool; a phone gets an honest message
-          rather than a layout that technically renders and cannot be used. */}
-      <div className="ed-mobile-gate">
-        <div className="ed-mobile-inner">
-          <div className="ed-empty-icon">🖥️</div>
-          <h3>ReelMind needs a desktop</h3>
-          <p>
-            The editor runs video decoding, transcription and rendering locally, in a four-panel
-            layout that does not fit a phone screen. Open this on a laptop or desktop in Chrome or
-            Edge.
-          </p>
-          <Link to="/" className="ed-btn ed-btn-primary ed-btn-block">
-            Back to the homepage
-          </Link>
+  // Timeline lanes, built once and placed either inline or inside the mobile
+  // sheet — the same nodes, so keyboard state does not fork between layouts.
+  const timelineLanes = (
+    <>
+      <div className="ed-tl-track">
+        <div className="ed-tl-label" id="ed-tl-video-label">
+          Video
+        </div>
+        <div
+          className="ed-tl-lane"
+          ref={tlRef}
+          role="listbox"
+          tabIndex={videoBlocks.length ? 0 : -1}
+          aria-labelledby="ed-tl-video-label"
+          aria-activedescendant={focusedBlock ? `tl-opt-${focusedBlock.key}` : undefined}
+          onKeyDown={onTimelineKey}
+        >
+          {videoBlocks.length ? (
+            videoBlocks.map((b, i) => (
+              <div
+                key={b.key}
+                id={`tl-opt-${b.key}`}
+                data-tl-index={i}
+                role="option"
+                aria-selected={i === tlFocus}
+                className={`ed-block role-${b.role}${i === tlFocus ? ' is-cursor' : ''}`}
+                style={{ width: Math.max(56, b.len * PX_PER_SEC) }}
+                title={`${b.name} · ${b.len.toFixed(1)}s${b.transition ? ` · ${b.transition}` : ''}`}
+                onClick={() => {
+                  setTlFocus(i)
+                  selectBlock(b)
+                }}
+              >
+                <span className="ed-block-name">{b.name}</span>
+                <span className="ed-block-len">{b.len.toFixed(1)}s</span>
+              </div>
+            ))
+          ) : (
+            <div className="ed-tl-hint">Video track builds from your clips (or the AI plan).</div>
+          )}
         </div>
       </div>
+      <div className="ed-tl-track">
+        <div className="ed-tl-label">Music</div>
+        <div className="ed-tl-lane">
+          {plan && plan.music !== 'none' ? (
+            <div
+              className="ed-block role-music"
+              style={{ width: Math.max(120, totalPlanLen * PX_PER_SEC) }}
+            >
+              <span className="ed-block-name">{plan.music} bed</span>
+            </div>
+          ) : (
+            <div className="ed-tl-hint">No music track</div>
+          )}
+        </div>
+      </div>
+      <div className="ed-tl-track">
+        <div className="ed-tl-label">Captions</div>
+        <div className="ed-tl-lane">
+          <div className="ed-tl-hint">
+            {hasCaptions
+              ? `${Object.values(captionCuesByClip).reduce((a, c) => a + c.length, 0)} cues ready${burnCaptions ? ' · burning in' : ' · SRT/VTT only'}`
+              : 'Transcribe a clip to generate captions'}
+          </div>
+        </div>
+      </div>
+      {!!videoBlocks.length && (
+        <p className="ed-tl-help">
+          Timeline is keyboard accessible: <kbd>←</kbd> <kbd>→</kbd> move between shots,{' '}
+          <kbd>Enter</kbd> selects, <kbd>Delete</kbd> removes.
+        </p>
+      )}
+    </>
+  )
+
+  return (
+    <div className={`ed mode-${mode}`}>
+      <style>{CSS}</style>
 
       {/* Reopen: the browser cannot keep file access between sessions. */}
       {restoreRefs && (
-        <div className="ed-restore">
-          <div className="ed-restore-card">
-            <h3>Reselect your clips</h3>
+        <div className="ed-restore ed-sheet-host">
+          <div className="ed-restore-card ed-sheet" role="dialog" aria-modal="true" aria-labelledby="ed-restore-h">
+            <h3 id="ed-restore-h">Reselect your clips</h3>
             <p className="ed-dim">
               Browsers cannot keep access to your files between sessions. Your edit is saved —
               reselect the same clips to continue. Transcripts, analysis and your take choices are
@@ -1096,20 +1291,25 @@ export default function Editor() {
 
       <div className="ed-body">
         {/* LEFT SIDEBAR */}
-        <aside className="ed-side ed-side-left">
-          <div className="ed-tabs">
-            {['clips', 'transcript', 'style', 'music', 'fx'].map((t) => (
-              <button
-                key={t}
-                className={`ed-tab${leftTab === t ? ' is-active' : ''}`}
-                onClick={() => setLeftTab(t)}
-              >
-                {t === 'fx' ? 'FX' : t[0].toUpperCase() + t.slice(1)}
-              </button>
-            ))}
-          </div>
+        <aside className="ed-side ed-side-left" hidden={!showLeftPanel} aria-label="Editing panels">
+          {/* In single-panel mode the bottom tab bar is the tab strip. */}
+          {!singleMode && (
+            <div className="ed-tabs" role="tablist" aria-label="Left panel">
+              {LEFT_TABS.map((t) => (
+                <button
+                  key={t}
+                  role="tab"
+                  aria-selected={activeLeftTab === t}
+                  className={`ed-tab${activeLeftTab === t ? ' is-active' : ''}`}
+                  onClick={() => setLeftTab(t)}
+                >
+                  {tabLabel(t)}
+                </button>
+              ))}
+            </div>
+          )}
 
-          {leftTab === 'clips' && (
+          {activeLeftTab === 'clips' && (
             <div className="ed-side-scroll">
               <div
                 className={`ed-drop${dragging ? ' is-drag' : ''}`}
@@ -1120,10 +1320,17 @@ export default function Editor() {
                 onDragLeave={() => setDragging(false)}
                 onDrop={onDrop}
                 onClick={pickClips}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault()
+                    pickClips()
+                  }
+                }}
                 role="button"
                 tabIndex={0}
+                aria-label="Add video files"
               >
-                <div className="ed-drop-icon">▶</div>
+                <div className="ed-drop-icon" aria-hidden="true">▶</div>
                 <div className="ed-drop-t">{probing ? 'Reading metadata…' : 'Drop video files'}</div>
                 <div className="ed-drop-d">or click to browse · mp4, mov, webm</div>
                 <input
@@ -1179,6 +1386,16 @@ export default function Editor() {
                     key={c.id}
                     className={`ed-lib-row${selectedId === c.id ? ' is-sel' : ''}`}
                     onClick={() => setSelectedId(c.id)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault()
+                        setSelectedId(c.id)
+                      }
+                    }}
+                    role="button"
+                    tabIndex={0}
+                    aria-pressed={selectedId === c.id}
+                    aria-label={`Select ${c.name}`}
                   >
                     <div className="ed-thumb">
                       {c.thumb ? <img src={c.thumb} alt="" /> : <div className="ed-thumb-x">?</div>}
@@ -1243,29 +1460,63 @@ export default function Editor() {
                         )}
                       </div>
                     </div>
-                    <button
-                      className="ed-x"
-                      title="Remove clip"
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        removeClip(c.id)
-                      }}
-                    >
-                      ×
-                    </button>
+                    {/* Removing a transcribed clip throws away minutes of local
+                        Whisper work, so that case asks first. */}
+                    {transcripts[c.id] && !transcripts[c.id].error ? (
+                      <ConfirmButton
+                        className="ed-x"
+                        confirmLabel="✓"
+                        title="Remove clip"
+                        ariaLabel={`Remove ${c.name} and discard its transcript`}
+                        onConfirm={() => removeClip(c.id)}
+                      >
+                        ×
+                      </ConfirmButton>
+                    ) : (
+                      <button
+                        className="ed-x"
+                        title="Remove clip"
+                        aria-label={`Remove ${c.name}`}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          removeClip(c.id)
+                        }}
+                      >
+                        ×
+                      </button>
+                    )}
                   </div>
                 ))}
+                {probing && !clips.length && <SkeletonRows count={3} />}
                 {!clips.length && !probing && (
-                  <div className="ed-lib-empty">No clips yet. Add footage above.</div>
+                  <EmptyState icon="🎞" title="No clips yet" compact>
+                    Drop footage on the zone above — phone video, drone shots, screen recordings.
+                    ReelMind probes each file locally for its real duration and resolution.
+                  </EmptyState>
                 )}
               </div>
             </div>
           )}
 
-          {leftTab === 'transcript' && (
+          {activeLeftTab === 'transcript' && (
             <div className="ed-side-scroll">
               {!selected ? (
-                <p className="ed-dim">Select a clip to see its transcript.</p>
+                <EmptyState
+                  icon="💬"
+                  title="No clip selected"
+                  compact
+                  action={
+                    clips.length ? (
+                      <button className="ed-btn ed-btn-sm" onClick={() => setLeftTab('clips')}>
+                        Go to clips
+                      </button>
+                    ) : null
+                  }
+                >
+                  {clips.length
+                    ? 'Pick a clip in the Clips panel to read, strike and re-take its lines.'
+                    : 'Add footage first — transcripts are built per clip from its own audio.'}
+                </EmptyState>
               ) : !selTranscript ? (
                 <div className="ed-placeholder">
                   <p>No transcript for “{selected.name}” yet.</p>
@@ -1398,9 +1649,11 @@ export default function Editor() {
                           <button
                             className="ed-tx-strike"
                             title={isStruck ? 'Include this line' : 'Exclude this line from the edit'}
+                            aria-label={`${isStruck ? 'Include' : 'Exclude'} line at ${fmtTime(s.start)}`}
+                            aria-pressed={isStruck}
                             onClick={() => toggleStruck(selected.id, i)}
                           >
-                            {isStruck ? '↺' : 'S'}
+                            <span aria-hidden="true">{isStruck ? '↺' : 'S'}</span>
                           </button>
                         </div>
                       )
@@ -1493,7 +1746,7 @@ export default function Editor() {
             </div>
           )}
 
-          {leftTab === 'style' && (
+          {activeLeftTab === 'style' && (
             <div className="ed-side-scroll">
               {styleAnalyzing ? (
                 <div className="ed-style-progress">
@@ -1535,10 +1788,17 @@ export default function Editor() {
                       if (e.dataTransfer?.files?.length) ingestStyleVideos(e.dataTransfer.files)
                     }}
                     onClick={() => styleInputRef.current?.click()}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault()
+                        styleInputRef.current?.click()
+                      }
+                    }}
                     role="button"
                     tabIndex={0}
+                    aria-label="Add past edited videos to learn your style"
                   >
-                    <div className="ed-drop-icon">✦</div>
+                    <div className="ed-drop-icon" aria-hidden="true">✦</div>
                     <div className="ed-drop-t">Add 1-5 of your past edited videos</div>
                     <div className="ed-drop-d">drop here or click to browse</div>
                     <input
@@ -1610,9 +1870,14 @@ export default function Editor() {
                         <button className="ed-btn ed-btn-sm" onClick={() => doRenameProfile(activeProfile.id)}>
                           Rename
                         </button>
-                        <button className="ed-btn ed-btn-sm" onClick={() => doDeleteProfile(activeProfile.id)}>
+                        <ConfirmButton
+                          className="ed-btn ed-btn-sm"
+                          confirmLabel="Delete?"
+                          ariaLabel={`Delete style profile ${activeProfile.name}`}
+                          onConfirm={() => doDeleteProfile(activeProfile.id)}
+                        >
                           Delete
-                        </button>
+                        </ConfirmButton>
                       </div>
                       <input
                         ref={styleInputRef}
@@ -1633,7 +1898,7 @@ export default function Editor() {
             </div>
           )}
 
-          {leftTab === 'music' && (
+          {activeLeftTab === 'music' && (
             <div className="ed-side-scroll ed-placeholder">
               <p>Music mood is chosen by the planner.</p>
               <div className="ed-chip-row">
@@ -1647,7 +1912,7 @@ export default function Editor() {
             </div>
           )}
 
-          {leftTab === 'fx' && (
+          {activeLeftTab === 'fx' && (
             <div className="ed-side-scroll ed-placeholder">
               <p>Transitions per segment come from the plan:</p>
               <div className="ed-chip-row">
@@ -1691,8 +1956,8 @@ export default function Editor() {
                   </div>
                 )}
                 <div className="ed-preview-bar">
-                  <button className="ed-play" onClick={togglePlay}>
-                    {playing ? '❚❚' : '▶'}
+                  <button className="ed-play" onClick={togglePlay} aria-label={playing ? 'Pause preview' : 'Play preview'}>
+                    <span aria-hidden="true">{playing ? '❚❚' : '▶'}</span>
                   </button>
                   <span className="ed-time">
                     {fmtTime(currentTime)} / {fmtTime(selected.duration)}
@@ -1702,12 +1967,22 @@ export default function Editor() {
               </>
             ) : (
               <div className="ed-empty">
-                <div className="ed-empty-icon">🎬</div>
+                <div className="ed-empty-icon" aria-hidden="true">🎬</div>
                 <h3>No clips loaded</h3>
                 <p>
-                  Add video files from the <strong>Clips</strong> panel on the left — drag them onto
-                  the drop zone or click to browse. Your footage never leaves this browser.
+                  {singleMode
+                    ? 'Open the Clips tab below and add video files. Your footage never leaves this browser.'
+                    : 'Add video files from the Clips panel on the left — drag them onto the drop zone or click to browse. Your footage never leaves this browser.'}
                 </p>
+                <button
+                  className="ed-btn ed-btn-primary"
+                  onClick={() => {
+                    setLeftTab('clips')
+                    pickClips()
+                  }}
+                >
+                  Add footage
+                </button>
               </div>
             )}
           </div>
@@ -1763,67 +2038,109 @@ export default function Editor() {
             </div>
           </div>
 
-          {/* TIMELINE */}
-          <div className="ed-timeline">
-            <div className="ed-tl-track">
-              <div className="ed-tl-label">Video</div>
-              <div className="ed-tl-lane">
-                {videoBlocks.length ? (
-                  videoBlocks.map((b) => (
-                    <div
-                      key={b.key}
-                      className={`ed-block role-${b.role}`}
-                      style={{ width: Math.max(44, b.len * PX_PER_SEC) }}
-                      title={`${b.name} · ${b.len.toFixed(1)}s${b.transition ? ` · ${b.transition}` : ''}`}
-                    >
-                      <span className="ed-block-name">{b.name}</span>
-                      <span className="ed-block-len">{b.len.toFixed(1)}s</span>
-                    </div>
-                  ))
-                ) : (
-                  <div className="ed-tl-hint">Video track builds from your clips (or the AI plan).</div>
-                )}
+          {/* TIMELINE
+              Full and rail layouts show the lanes inline. Single-panel mode
+              collapses them to a tappable summary strip that opens a sheet —
+              a 3-lane timeline is unusable at 800px, but hiding it outright
+              loses the only view of what will actually render. */}
+          {singleMode ? (
+            <button
+              type="button"
+              className="ed-tl-summary"
+              onClick={() => setSheetOpen(true)}
+              aria-expanded={timelineSheet}
+            >
+              <span className="ed-tl-summary-main">
+                {videoBlocks.length
+                  ? `${videoBlocks.length} shot${videoBlocks.length === 1 ? '' : 's'} · ${fmtTime(totalPlanLen)}`
+                  : 'Timeline empty'}
+              </span>
+              <span className="ed-tl-summary-sub">
+                {plan && plan.music !== 'none' ? `${plan.music} bed` : 'no music'} · tap to open
+              </span>
+            </button>
+          ) : (
+            <div className="ed-timeline">{timelineLanes}</div>
+          )}
+
+          {timelineSheet && (
+            <div className="ed-sheet-host" onClick={() => setSheetOpen(false)}>
+              <div
+                className="ed-sheet ed-tl-sheet"
+                role="dialog"
+                aria-modal="true"
+                aria-label="Timeline"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="ed-sheet-head">
+                  <h3>Timeline</h3>
+                  <button className="ed-icon-btn" onClick={() => setSheetOpen(false)} aria-label="Close timeline">
+                    ×
+                  </button>
+                </div>
+                <div className="ed-timeline">{timelineLanes}</div>
               </div>
             </div>
-            <div className="ed-tl-track">
-              <div className="ed-tl-label">Music</div>
-              <div className="ed-tl-lane">
-                {plan && plan.music !== 'none' ? (
-                  <div
-                    className="ed-block role-music"
-                    style={{ width: Math.max(120, totalPlanLen * PX_PER_SEC) }}
-                  >
-                    <span className="ed-block-name">{plan.music} bed</span>
-                  </div>
-                ) : (
-                  <div className="ed-tl-hint">No music track</div>
-                )}
-              </div>
-            </div>
-            <div className="ed-tl-track">
-              <div className="ed-tl-label">Captions</div>
-              <div className="ed-tl-lane">
-                <div className="ed-tl-hint">Auto-captions coming soon</div>
-              </div>
-            </div>
-          </div>
+          )}
         </main>
 
-        {/* RIGHT SIDEBAR */}
-        <aside className="ed-side ed-side-right">
-          <div className="ed-tabs">
+        {/* ICON RAIL — 1024-1279px. The right panel has no room to sit beside
+            the stage, so it collapses to icons and slides over it on demand. */}
+        {railMode && (
+          <nav className="ed-rail" aria-label="Right panel">
             {['edit', 'grade', 'export'].map((t) => (
               <button
                 key={t}
-                className={`ed-tab${rightTab === t ? ' is-active' : ''}`}
-                onClick={() => setRightTab(t)}
+                className={`ed-rail-btn${rightOverlayOpen && rightTab === t ? ' is-active' : ''}`}
+                aria-label={tabLabel(t)}
+                aria-expanded={rightOverlayOpen && rightTab === t}
+                title={tabLabel(t)}
+                onClick={() => {
+                  if (rightOverlayOpen && rightTab === t) setRailOpen(false)
+                  else {
+                    setRightTab(t)
+                    setRailOpen(true)
+                  }
+                }}
               >
-                {t[0].toUpperCase() + t.slice(1)}
+                <span aria-hidden="true">{TAB_ICON[t]}</span>
               </button>
             ))}
-          </div>
+          </nav>
+        )}
 
-          {rightTab === 'edit' && (
+        {/* RIGHT SIDEBAR */}
+        <aside
+          className={`ed-side ed-side-right${rightOverlayOpen ? ' is-open' : ''}`}
+          hidden={!showRightPanel}
+          inert={railMode && !rightOverlayOpen ? '' : undefined}
+          aria-label="Export and plan panels"
+        >
+          {railMode && (
+            <div className="ed-overlay-head">
+              <span>{tabLabel(rightTab)}</span>
+              <button className="ed-icon-btn" onClick={() => setRailOpen(false)} aria-label="Close panel">
+                ×
+              </button>
+            </div>
+          )}
+          {!singleMode && (
+            <div className="ed-tabs" role="tablist" aria-label="Right panel">
+              {['edit', 'grade', 'export'].map((t) => (
+                <button
+                  key={t}
+                  role="tab"
+                  aria-selected={rightTab === t}
+                  className={`ed-tab${rightTab === t ? ' is-active' : ''}`}
+                  onClick={() => setRightTab(t)}
+                >
+                  {tabLabel(t)}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {!singleMode && rightTab === 'edit' && (
             <div className="ed-side-scroll ed-placeholder">
               {plan ? (
                 <>
@@ -1838,30 +2155,35 @@ export default function Editor() {
                         {s.start.toFixed(1)}s – {s.end.toFixed(1)}s · {(s.end - s.start).toFixed(1)}s · {s.transition}
                       </div>
                       <div className="ed-seg-ctl">
-                        <span className="ed-dim">in</span>
-                        <button onClick={() => adjustSegment(i, 'start', -0.5)} title="Start 0.5s earlier">−</button>
-                        <button onClick={() => adjustSegment(i, 'start', 0.5)} title="Start 0.5s later">+</button>
-                        <span className="ed-dim">out</span>
-                        <button onClick={() => adjustSegment(i, 'end', -0.5)} title="End 0.5s earlier">−</button>
-                        <button onClick={() => adjustSegment(i, 'end', 0.5)} title="End 0.5s later">+</button>
-                        <button
+                        <span className="ed-dim" aria-hidden="true">in</span>
+                        <button onClick={() => adjustSegment(i, 'start', -0.5)} title="Start 0.5s earlier" aria-label={`Shot ${i + 1}: start 0.5 seconds earlier`}>−</button>
+                        <button onClick={() => adjustSegment(i, 'start', 0.5)} title="Start 0.5s later" aria-label={`Shot ${i + 1}: start 0.5 seconds later`}>+</button>
+                        <span className="ed-dim" aria-hidden="true">out</span>
+                        <button onClick={() => adjustSegment(i, 'end', -0.5)} title="End 0.5s earlier" aria-label={`Shot ${i + 1}: end 0.5 seconds earlier`}>−</button>
+                        <button onClick={() => adjustSegment(i, 'end', 0.5)} title="End 0.5s later" aria-label={`Shot ${i + 1}: end 0.5 seconds later`}>+</button>
+                        <ConfirmButton
                           className="ed-seg-drop"
-                          onClick={() => dropSegment(i)}
+                          confirmLabel="✓"
                           title="Remove this shot from the edit"
+                          ariaLabel={`Remove shot ${i + 1} (${s.clip}) from the edit`}
+                          onConfirm={() => dropSegment(i)}
                         >
                           ×
-                        </button>
+                        </ConfirmButton>
                       </div>
                     </div>
                   ))}
                 </>
               ) : (
-                <p className="ed-dim">Generate a plan to see per-segment edits.</p>
+                <EmptyState icon="✂" title="No plan yet" compact>
+                  Describe the edit under the preview and hit Generate. Each shot then shows up here
+                  with its in/out points, ready to trim or drop.
+                </EmptyState>
               )}
             </div>
           )}
 
-          {rightTab === 'grade' && (
+          {!singleMode && rightTab === 'grade' && (
             <div className="ed-side-scroll ed-placeholder">
               <p>Color grade</p>
               {['Exposure', 'Contrast', 'Saturation', 'Temperature'].map((g) => (
@@ -1874,7 +2196,7 @@ export default function Editor() {
             </div>
           )}
 
-          {rightTab === 'export' && (
+          {(singleMode || rightTab === 'export') && (
             <div className="ed-side-scroll">
               <label className="ed-field">
                 <span>Resolution</span>
@@ -1965,16 +2287,7 @@ export default function Editor() {
               )}
 
               {(rendering || progress.pct > 0) && (
-                <div className="ed-prog">
-                  <div className="ed-prog-bar">
-                    <div className="ed-prog-fill" style={{ width: `${progress.pct}%` }} />
-                  </div>
-                  <div className="ed-prog-msg">
-                    <span>{progress.stage || 'idle'}</span>
-                    <span>{progress.pct}%</span>
-                  </div>
-                  <div className="ed-dim">{progress.msg}</div>
-                </div>
+                <RenderProgress progress={progress} startedAt={renderStartedAt} running={rendering} />
               )}
 
               {renderError && <div className="ed-bad ed-mt">{renderError}</div>}
@@ -2148,7 +2461,47 @@ export default function Editor() {
             </div>
           )}
         </aside>
+
+        {/* Tapping outside the slid-over panel closes it. */}
+        {rightOverlayOpen && (
+          <div className="ed-scrim" onClick={() => setRailOpen(false)} aria-hidden="true" />
+        )}
       </div>
+
+      {/* BOTTOM TAB BAR — single-panel mode only. */}
+      {singleMode && (
+        <nav className="ed-tabbar" role="tablist" aria-label="Panels">
+          {MOBILE_TABS.map((t) => (
+            <button
+              key={t}
+              role="tab"
+              aria-selected={activeLeftTab === t}
+              className={`ed-tabbar-btn${activeLeftTab === t ? ' is-active' : ''}`}
+              onClick={() => {
+                setLeftTab(t)
+                if (t === 'export') setRightTab('export')
+              }}
+            >
+              <span className="ed-tabbar-icon" aria-hidden="true">
+                {TAB_ICON[t]}
+              </span>
+              <span className="ed-tabbar-label">{tabLabel(t)}</span>
+            </button>
+          ))}
+        </nav>
+      )}
+
+      {/* Render outcome is announced, not just shown — a long render finishing
+          while the user is in another tab should reach a screen reader. */}
+      <span className="sr-only" role="status" aria-live="polite">
+        {rendering
+          ? ''
+          : result
+            ? `Render complete. ${result.shots ?? ''} shots, ${fmtSize(result.size)}.`
+            : renderError
+              ? `Render failed. ${renderError}`
+              : ''}
+      </span>
     </div>
   )
 }
@@ -2166,32 +2519,33 @@ function Meter({ label, v }) {
 }
 
 const CSS = `
-.ed { position: fixed; inset: 0; display: flex; flex-direction: column; background: var(--bg); color: var(--text); font-size: 14px; }
+.ed { position: fixed; inset: 0; display: flex; flex-direction: column; background: var(--bg); color: var(--text); font-size: 14px;
+  --ed-side: var(--side-w); --ed-stage-pad: var(--s4); --ed-tl-h: var(--timeline-h); }
 
-.ed-top { display: flex; align-items: center; gap: 16px; height: 54px; padding: 0 16px; background: var(--panel); border-bottom: 1px solid var(--border); flex: none; }
+.ed-top { display: flex; align-items: center; gap: var(--s3); min-height: 54px; padding: var(--s2) var(--s4); background: var(--panel); border-bottom: 1px solid var(--border); flex: none; }
 .ed-logo { font-family: 'Syne', sans-serif; font-weight: 800; font-size: 17px; }
 .ed-logo span { background: linear-gradient(90deg, var(--cyan), var(--purple)); -webkit-background-clip: text; background-clip: text; color: transparent; }
 .ed-top-mid { margin: 0 auto; text-align: center; font-family: 'Syne', sans-serif; font-weight: 600; display: flex; flex-direction: column; line-height: 1.3; }
 .ed-top-sub { font-family: 'DM Sans', sans-serif; font-weight: 400; font-size: 11.5px; color: var(--muted); }
 
-.ed-btn { border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 9px; padding: 8px 16px; font-weight: 600; font-size: 13px; transition: transform .12s, box-shadow .12s, opacity .12s; }
+.ed-btn { display: inline-flex; align-items: center; justify-content: center; gap: var(--s2); min-height: var(--tap); border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: var(--r-md); padding: var(--s2) var(--s4); font-weight: 600; font-size: 13px; transition: transform .12s, box-shadow .12s, opacity .12s; }
 .ed-btn:hover:not(:disabled) { transform: translateY(-1px); }
 .ed-btn:disabled { opacity: .4; cursor: not-allowed; }
 .ed-btn-primary { background: linear-gradient(90deg, var(--cyan), var(--purple)); color: #05050a; border-color: transparent; }
 .ed-btn-primary:hover:not(:disabled) { box-shadow: 0 6px 22px -6px rgba(155,93,255,.6); }
-.ed-btn-block { width: 100%; margin-top: 12px; }
+.ed-btn-block { width: 100%; margin-top: var(--s3); }
 
 .ed-body { flex: 1; display: flex; min-height: 0; }
-.ed-side { width: 236px; flex: none; background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
+.ed-side { width: var(--ed-side); flex: none; background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
 .ed-side-left { border-right: 1px solid var(--border); }
 .ed-side-right { border-left: 1px solid var(--border); }
-.ed-side-scroll { flex: 1; overflow-y: auto; padding: 14px; }
+.ed-side-scroll { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: var(--s4); display: flex; flex-direction: column; }
 
 .ed-tabs { display: flex; border-bottom: 1px solid var(--border); flex: none; }
-.ed-tab { flex: 1; background: none; border: none; color: var(--muted); padding: 12px 4px; font-size: 12.5px; font-weight: 600; border-bottom: 2px solid transparent; }
+.ed-tab { flex: 1; min-height: var(--tap); background: none; border: none; color: var(--muted); padding: var(--s3) var(--s1); font-size: 12.5px; font-weight: 600; border-bottom: 2px solid transparent; }
 .ed-tab.is-active { color: var(--text); border-bottom-color: var(--purple); }
 
-.ed-drop { border: 1.5px dashed var(--border); border-radius: 12px; padding: 22px 12px; text-align: center; background: var(--surface); transition: border-color .15s, background .15s; cursor: pointer; }
+.ed-drop { border: 1.5px dashed var(--border); border-radius: var(--r-lg); padding: var(--s6) var(--s3); text-align: center; background: var(--surface); transition: border-color .15s, background .15s; cursor: pointer; }
 .ed-drop.is-drag { border-color: var(--cyan); background: rgba(9,246,255,.06); }
 .ed-drop-icon { width: 34px; height: 34px; margin: 0 auto 10px; border-radius: 50%; display: grid; place-items: center; background: linear-gradient(90deg, var(--cyan), var(--purple)); color: #05050a; font-size: 13px; }
 .ed-drop-t { font-weight: 600; font-size: 13px; }
@@ -2201,7 +2555,7 @@ const CSS = `
 .ed-err { background: rgba(255,37,102,.08); border: 1px solid rgba(255,37,102,.35); border-radius: 8px; padding: 8px 10px; font-size: 11.5px; color: #ffb3c6; }
 .ed-err strong { display: block; color: var(--pink); margin-bottom: 2px; word-break: break-all; }
 
-.ed-lib { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
+.ed-lib { margin-top: var(--s4); display: flex; flex-direction: column; gap: var(--s2); }
 .ed-lib-row { display: flex; gap: 9px; align-items: center; padding: 7px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); cursor: pointer; transition: border-color .12s; }
 .ed-lib-row:hover { border-color: #2a2a42; }
 .ed-lib-row.is-sel { border-color: var(--cyan); box-shadow: inset 0 0 0 1px var(--cyan); }
@@ -2221,11 +2575,11 @@ const CSS = `
 .ed-spin { display: inline-block; width: 9px; height: 9px; border: 1.5px solid var(--border); border-top-color: var(--cyan); border-radius: 50%; animation: ed-spin .7s linear infinite; vertical-align: -1px; }
 @keyframes ed-spin { to { transform: rotate(360deg); } }
 
-.ed-btn-sm { padding: 6px 12px; font-size: 12px; border-radius: 8px; }
+.ed-btn-sm { padding: var(--s2) var(--s3); font-size: 12px; border-radius: var(--r-sm); min-height: var(--tap); }
 .ed-transcribe-all { margin-top: 12px; }
 .ed-prog-tight { margin-top: 8px; }
 .ed-row-actions { margin-top: 6px; }
-.ed-linkbtn { background: none; border: none; padding: 0; font-size: 10.5px; font-weight: 600; color: var(--cyan); }
+.ed-linkbtn { background: none; border: none; padding: var(--s1) 0; min-height: 24px; font-size: 11px; font-weight: 600; color: var(--cyan); text-align: left; }
 .ed-linkbtn:hover:not(:disabled) { text-decoration: underline; }
 .ed-linkbtn:disabled { color: var(--muted); cursor: not-allowed; }
 .ed-linkbtn.is-ok { color: #7CFFB2; }
@@ -2241,7 +2595,8 @@ const CSS = `
 .ed-tx-text:hover { color: var(--cyan); }
 .ed-tx-time { font-size: 9.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .ed-tx-filler { background: rgba(255,37,102,.22); border-radius: 3px; box-shadow: 0 0 0 1px rgba(255,37,102,.35) inset; }
-.ed-tx-strike { flex: none; width: 20px; height: 20px; border-radius: 5px; border: 1px solid var(--border); background: var(--surface); color: var(--muted); font-size: 10px; margin-top: 4px; }
+.ed-tx-strike { flex: none; min-width: var(--tap); min-height: var(--tap); display: grid; place-items: center; border-radius: var(--r-sm);
+  border: 1px solid var(--border); background: var(--surface); color: var(--muted); font-size: 10px; margin-top: var(--s1); }
 .ed-tx-strike:hover { border-color: var(--pink); color: var(--pink); }
 
 .ed-retake-badge { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; padding: 7px 9px; border-radius: 8px; font-size: 11px; color: var(--cyan); background: rgba(9,246,255,.08); border: 1px solid rgba(9,246,255,.3); }
@@ -2257,7 +2612,8 @@ const CSS = `
 .ed-retake-take.is-chosen .ed-retake-text { color: var(--text); }
 .ed-retake-take.is-chosen { background: rgba(155,93,255,.14); }
 .ed-retake-take.is-cut .ed-retake-text { text-decoration: line-through; opacity: .4; }
-.ed-x { background: none; border: none; color: var(--muted); font-size: 17px; line-height: 1; padding: 2px 4px; flex: none; }
+.ed-x { background: none; border: none; color: var(--muted); font-size: 17px; line-height: 1; flex: none; border-radius: var(--r-sm);
+  min-width: var(--tap); min-height: var(--tap); display: grid; place-items: center; }
 .ed-x:hover { color: var(--pink); }
 .ed-lib-empty, .ed-tl-hint { color: var(--muted); font-size: 12px; }
 .ed-lib-empty { padding: 14px 4px; }
@@ -2265,39 +2621,43 @@ const CSS = `
 .ed-placeholder p { color: var(--text); font-size: 12.5px; margin: 0 0 10px; }
 .ed-dim { color: var(--muted); font-size: 11.5px; }
 .ed-mt { margin-top: 10px; }
-.ed-chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+.ed-chip-row { display: flex; flex-wrap: wrap; gap: var(--s2); margin-bottom: var(--s4); }
 .ed-chip { font-size: 11px; padding: 4px 9px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface); color: var(--muted); }
 .ed-chip.is-on { border-color: var(--cyan); color: var(--cyan); }
 
 .ed-slider { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; font-size: 11.5px; color: var(--muted); }
 .ed-slider input { width: 100%; accent-color: var(--purple); }
 
-.ed-stage { flex: 1; display: flex; flex-direction: column; min-width: 0; padding: 16px; gap: 14px; overflow: hidden; }
-.ed-preview { flex: 1; min-height: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; position: relative; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+.ed-stage { flex: 1; display: flex; flex-direction: column; min-width: 0; padding: var(--ed-stage-pad); gap: var(--s3); overflow: hidden; }
+.ed-preview { flex: 1; min-height: 140px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg); position: relative; display: flex; align-items: center; justify-content: center; overflow: hidden; }
 .ed-video { max-width: 100%; max-height: 100%; background: #000; cursor: pointer; }
 .ed-preview-bar { position: absolute; left: 0; right: 0; bottom: 0; display: flex; align-items: center; gap: 12px; padding: 10px 14px; background: linear-gradient(transparent, rgba(0,0,0,.7)); font-size: 12px; }
-.ed-play { width: 30px; height: 30px; border-radius: 50%; border: none; background: var(--text); color: #05050a; font-size: 11px; }
+.ed-play { width: var(--tap); height: var(--tap); min-width: 32px; min-height: 32px; display: grid; place-items: center; border-radius: 50%; border: none; background: var(--text); color: #05050a; font-size: 11px; flex: none; }
 .ed-time { font-variant-numeric: tabular-nums; }
 .ed-preview-name { margin-left: auto; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40%; }
 
 .ed-empty { text-align: center; max-width: 380px; padding: 20px; }
 .ed-empty-icon { font-size: 40px; }
 .ed-empty h3 { margin: 14px 0 8px; }
-.ed-empty p { color: var(--muted); font-size: 13px; line-height: 1.6; }
+.ed-empty p { color: var(--muted); font-size: 13px; line-height: 1.6; margin-bottom: var(--s4); }
 
-.ed-ai { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px; flex: none; }
-.ed-ai-row { display: flex; gap: 8px; }
-.ed-ai-input { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; color: var(--text); font-size: 13px; }
+.ed-ai { background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-lg); padding: var(--s3); flex: none; }
+.ed-ai-row { display: flex; gap: var(--s2); flex-wrap: wrap; }
+.ed-ai-input { flex: 1; min-width: 160px; min-height: var(--tap); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); padding: var(--s2) var(--s3); color: var(--text); font-size: 13px; }
 .ed-ai-input:focus { outline: none; border-color: var(--purple); }
 .ed-ai-status { margin-top: 8px; font-size: 12px; line-height: 1.5; }
 .ed-ok { color: var(--cyan); }
 .ed-bad { color: var(--pink); font-size: 12px; }
 
-.ed-timeline { flex: none; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+.ed-timeline { flex: none; background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-lg); padding: var(--s2); display: flex; flex-direction: column; gap: var(--s2); max-height: var(--ed-tl-h); overflow-y: auto; }
 .ed-tl-track { display: flex; align-items: stretch; gap: 8px; }
 .ed-tl-label { width: 64px; flex: none; font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); display: flex; align-items: center; }
-.ed-tl-lane { flex: 1; min-height: 42px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; display: flex; align-items: stretch; gap: 3px; padding: 3px; overflow-x: auto; }
-.ed-block { flex: none; border-radius: 6px; padding: 5px 8px; display: flex; flex-direction: column; justify-content: space-between; overflow: hidden; background: linear-gradient(160deg, rgba(9,246,255,.18), rgba(155,93,255,.18)); border: 1px solid rgba(155,93,255,.4); }
+.ed-tl-lane { flex: 1; min-height: 44px; min-width: 0; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); display: flex; align-items: stretch; gap: 3px; padding: 3px;
+  overflow-x: auto; overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch; scroll-behavior: smooth; }
+.ed-block { flex: none; min-width: 44px; border-radius: var(--r-sm); padding: var(--s1) var(--s2); display: flex; flex-direction: column; justify-content: space-between; overflow: hidden; cursor: pointer;
+  background: linear-gradient(160deg, rgba(9,246,255,.18), rgba(155,93,255,.18)); border: 1px solid rgba(155,93,255,.4); }
+.ed-block.is-cursor { box-shadow: inset 0 0 0 2px var(--cyan); }
+.ed-tl-lane:focus-visible { box-shadow: var(--ring); }
 .ed-block.role-hook { background: linear-gradient(160deg, rgba(9,246,255,.28), rgba(9,246,255,.1)); border-color: var(--cyan); }
 .ed-block.role-outro { background: linear-gradient(160deg, rgba(255,37,102,.24), rgba(255,37,102,.08)); border-color: rgba(255,37,102,.5); }
 .ed-block.role-music { background: linear-gradient(160deg, rgba(155,93,255,.24), rgba(155,93,255,.06)); border-color: rgba(155,93,255,.5); }
@@ -2305,8 +2665,8 @@ const CSS = `
 .ed-block-len { font-size: 9.5px; color: var(--muted); }
 .ed-tl-hint { padding: 0 8px; display: flex; align-items: center; }
 
-.ed-field { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--muted); }
-.ed-field select { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; color: var(--text); font-size: 13px; }
+.ed-field { display: flex; flex-direction: column; gap: var(--s1); font-size: 12px; color: var(--muted); }
+.ed-field select { min-height: var(--tap); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); padding: var(--s2) var(--s3); color: var(--text); font-size: 13px; }
 
 .ed-engine { display: flex; align-items: center; gap: 7px; margin-top: 10px; font-size: 11.5px; color: var(--muted); }
 .ed-engine-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
@@ -2322,8 +2682,8 @@ const CSS = `
 .ed-result { margin-top: 16px; display: flex; flex-direction: column; gap: 10px; }
 .ed-result-vid { width: 100%; border-radius: 8px; background: #000; }
 
-.ed-toggle { display: flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--muted); cursor: pointer; }
-.ed-toggle input { accent-color: var(--purple); }
+.ed-toggle { display: flex; align-items: center; gap: var(--s2); min-height: var(--tap); font-size: 11.5px; color: var(--muted); cursor: pointer; }
+.ed-toggle input { accent-color: var(--purple); width: 17px; height: 17px; flex: none; }
 
 /* captions */
 .ed-caps { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 9px; }
@@ -2335,7 +2695,7 @@ const CSS = `
 .ed-promptsize.is-over .ed-promptsize-head { color: var(--pink); }
 
 .ed-rate { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); font-size: 12px; display: flex; flex-direction: column; gap: 8px; }
-.ed-rate-row { display: flex; gap: 6px; }
+.ed-rate-row { display: flex; gap: var(--s2); flex-wrap: wrap; }
 .ed-rate-row .ed-btn { flex: 1; padding: 6px 4px; }
 
 .ed-quality { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; max-height: 300px; overflow-y: auto; }
@@ -2351,21 +2711,22 @@ const CSS = `
 .ed-quality-fixes { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .ed-quality-fixes span { font-size: 9.5px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
 
-.ed-seg-ctl { display: flex; align-items: center; gap: 4px; margin-top: 7px; }
+.ed-seg-ctl { display: flex; align-items: center; gap: var(--s1); margin-top: var(--s2); flex-wrap: wrap; }
 .ed-seg-ctl > .ed-dim { font-size: 9.5px; text-transform: uppercase; letter-spacing: .05em; }
-.ed-seg-ctl button { width: 20px; height: 20px; border-radius: 5px; border: 1px solid var(--border); background: var(--bg); color: var(--muted); font-size: 12px; line-height: 1; }
+.ed-seg-ctl button { min-width: var(--tap); min-height: var(--tap); display: inline-grid; place-items: center; border-radius: var(--r-sm);
+  border: 1px solid var(--border); background: var(--bg); color: var(--muted); font-size: 13px; line-height: 1; padding: 0; }
 .ed-seg-ctl button:hover { border-color: var(--cyan); color: var(--cyan); }
 .ed-seg-drop { margin-left: auto; }
 .ed-seg-drop:hover { border-color: var(--pink) !important; color: var(--pink) !important; }
 
 /* project persistence */
-.ed-project-name { background: none; border: 1px solid transparent; border-radius: 6px; color: var(--text); font-family: 'Syne', sans-serif; font-weight: 600; font-size: 14px; text-align: center; padding: 2px 8px; width: 260px; max-width: 40vw; }
+.ed-project-name { background: none; border: 1px solid transparent; border-radius: var(--r-sm); color: var(--text); font-family: 'Syne', sans-serif; font-weight: 600; font-size: 14px; text-align: center; padding: var(--s1) var(--s2); width: clamp(120px, 32vw, 260px); }
 .ed-project-name:hover { border-color: var(--border); }
 .ed-project-name:focus { outline: none; border-color: var(--purple); background: var(--bg); }
 .ed-top-projects { padding: 7px 13px; font-size: 12.5px; }
 
 .ed-restore { position: fixed; inset: 0; z-index: 60; background: rgba(5,5,10,.86); backdrop-filter: blur(6px); display: grid; place-items: center; padding: 24px; }
-.ed-restore-card { width: min(520px, 100%); max-height: 84vh; overflow-y: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 22px; display: flex; flex-direction: column; gap: 10px; }
+.ed-restore-card { width: min(520px, 100%); max-height: 84vh; overflow-y: auto; background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-xl); padding: var(--s6); display: flex; flex-direction: column; gap: var(--s3); }
 .ed-restore-card h3 { font-size: 19px; }
 .ed-restore-list { list-style: none; margin: 6px 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .ed-restore-list li { display: flex; gap: 10px; align-items: center; padding: 8px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
@@ -2381,7 +2742,7 @@ const CSS = `
 .ed-style-card { margin-top: 12px; padding: 11px; border-radius: 10px; border: 1px solid var(--purple); background: rgba(155,93,255,.08); }
 .ed-style-name { font-family: 'Syne', sans-serif; font-weight: 700; font-size: 13px; margin-bottom: 5px; }
 .ed-style-desc { font-size: 12px; line-height: 1.55; color: var(--text); margin: 0 0 6px; }
-.ed-style-actions { display: flex; gap: 6px; margin-top: 12px; }
+.ed-style-actions { display: flex; gap: var(--s2); margin-top: var(--s3); flex-wrap: wrap; }
 .ed-style-actions .ed-btn { flex: 1; padding: 6px 4px; }
 
 .ed-caps-note { margin: 5px 0 0; font-size: 10.5px; line-height: 1.5; color: #ffcf8a; }
@@ -2391,7 +2752,7 @@ const CSS = `
 .ed-warn { font-size: 11px; line-height: 1.5; color: #ffcf8a; background: rgba(255,190,90,.09); border: 1px solid rgba(255,190,90,.35); border-radius: 8px; padding: 8px 10px; }
 .ed-caps-row { display: flex; align-items: center; gap: 6px; }
 .ed-caps-row > .ed-dim { width: 58px; flex: none; }
-.ed-seg-btn { border: 1px solid var(--border); background: var(--surface); color: var(--muted); border-radius: 7px; padding: 4px 10px; font-size: 11px; font-weight: 600; text-transform: capitalize; }
+.ed-seg-btn { min-height: var(--tap); min-width: var(--tap); border: 1px solid var(--border); background: var(--surface); color: var(--muted); border-radius: var(--r-sm); padding: var(--s1) var(--s3); font-size: 11px; font-weight: 600; text-transform: capitalize; }
 .ed-seg-btn.is-on { border-color: var(--cyan); color: var(--cyan); }
 .ed-caps-preview { position: relative; height: 74px; border-radius: 8px; background: linear-gradient(120deg, #1a1a28, #0f0f1b); border: 1px solid var(--border); display: flex; justify-content: center; overflow: hidden; }
 .ed-caps-preview.pos-bottom { align-items: flex-end; padding-bottom: 8px; }
@@ -2401,7 +2762,7 @@ const CSS = `
 .ed-caps-preview-text.sz-M { font-size: 15px; }
 .ed-caps-preview-text.sz-L { font-size: 19px; }
 .ed-caps-preview.has-bg .ed-caps-preview-text { background: rgba(0,0,0,.55); padding: 2px 8px; border-radius: 5px; -webkit-text-stroke: 0; }
-.ed-caps-dl { display: flex; gap: 8px; }
+.ed-caps-dl { display: flex; gap: var(--s2); flex-wrap: wrap; }
 
 /* live caption overlay on the center preview */
 .ed-cap-overlay { position: absolute; left: 0; right: 0; display: flex; flex-direction: column; align-items: center; gap: 2px; pointer-events: none; padding: 0 6%; text-align: center; z-index: 3; }
@@ -2440,16 +2801,92 @@ const CSS = `
 .ed-role.role-hook { color: var(--cyan); border-color: var(--cyan); }
 .ed-role.role-outro { color: var(--pink); border-color: rgba(255,37,102,.5); }
 
-@media (max-width: 1080px) {
-  .ed-side { width: 200px; }
+/* ---------------------------------------------------------------------
+   Shared chrome for the smaller layouts
+   ------------------------------------------------------------------ */
+.ed-icon-btn { min-width: var(--tap); min-height: var(--tap); display: grid; place-items: center; border-radius: var(--r-sm);
+  border: 1px solid var(--border); background: var(--surface); color: var(--muted); font-size: 18px; line-height: 1; }
+.ed-icon-btn:hover { color: var(--text); }
+
+.ed-scrim { position: absolute; inset: 0; z-index: 15; background: rgba(5,5,10,.6); backdrop-filter: blur(2px); }
+
+.ed-overlay-head { display: none; align-items: center; justify-content: space-between; gap: var(--s3);
+  padding: var(--s2) var(--s2) var(--s2) var(--s4); border-bottom: 1px solid var(--border); font-weight: 600; font-size: 13px; flex: none; }
+
+/* Timeline: cursor help line + the collapsed mobile summary */
+.ed-tl-help { margin: var(--s1) 0 0; font-size: 10.5px; color: var(--muted); }
+.ed-tl-help kbd { font-family: ui-monospace, Menlo, monospace; font-size: 10px; border: 1px solid var(--border);
+  border-radius: var(--r-sm); padding: 0 4px; background: var(--bg); }
+
+.ed-tl-summary { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; min-height: 56px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-lg); padding: var(--s3) var(--s4); color: var(--text); text-align: left; flex: none; }
+.ed-tl-summary-main { font-weight: 600; font-size: 13px; }
+.ed-tl-summary-sub { font-size: 11.5px; color: var(--muted); }
+
+/* Full-screen sheets. Under 768px every modal is a sheet, not a centered card
+   — a centered dialog on a phone leaves unreachable content behind the fold. */
+.ed-sheet-host { position: fixed; inset: 0; z-index: 60; background: rgba(5,5,10,.86); backdrop-filter: blur(6px);
+  display: grid; place-items: center; padding: var(--s6); }
+.ed-sheet-head { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); flex: none; margin-bottom: var(--s3); }
+.ed-sheet-head h3 { font-size: 16px; }
+.ed-tl-sheet { width: min(720px, 100%); max-height: 80vh; overflow-y: auto; background: var(--panel);
+  border: 1px solid var(--border); border-radius: var(--r-xl); padding: var(--s4); }
+.ed-tl-sheet .ed-timeline { max-height: none; }
+
+/* ---------------------------------------------------------------------
+   1024-1279px — right sidebar collapses to a 48px icon rail
+   ------------------------------------------------------------------ */
+.ed-rail { display: none; }
+
+.ed.mode-rail { --ed-side: clamp(200px, 20vw, 240px); --ed-tl-h: 120px; }
+.ed.mode-rail .ed-body { position: relative; }
+.ed.mode-rail .ed-rail { display: flex; flex-direction: column; gap: var(--s2); width: var(--rail-w); flex: none;
+  padding: var(--s2) 0; background: var(--panel); border-left: 1px solid var(--border); align-items: center; z-index: 25; }
+.ed.mode-rail .ed-rail-btn { width: 36px; height: 36px; display: grid; place-items: center; border-radius: var(--r-md);
+  border: 1px solid transparent; background: none; color: var(--muted); font-size: 15px; }
+.ed.mode-rail .ed-rail-btn:hover { color: var(--text); background: var(--surface); }
+.ed.mode-rail .ed-rail-btn.is-active { color: var(--cyan); border-color: var(--cyan); background: rgba(9,246,255,.1); }
+
+/* The panel slides over the stage rather than squeezing it. */
+.ed.mode-rail .ed-side-right { position: absolute; top: 0; bottom: 0; right: var(--rail-w); z-index: 20;
+  width: min(320px, 62vw); border-left: 1px solid var(--border); box-shadow: -18px 0 44px -20px rgba(0,0,0,.9);
+  transform: translateX(calc(100% + var(--rail-w))); visibility: hidden; transition: transform .22s ease, visibility .22s; }
+.ed.mode-rail .ed-side-right.is-open { transform: none; visibility: visible; }
+.ed.mode-rail .ed-overlay-head { display: flex; }
+@media (prefers-reduced-motion: reduce) {
+  .ed.mode-rail .ed-side-right { transition: none; }
 }
-/* Below tablet the editor is not usable, so replace it outright rather than
-   letting a four-pane layout stack into something broken. */
-@media (max-width: 860px) {
-  .ed-top, .ed-body, .ed-restore { display: none !important; }
-  .ed-mobile-gate { display: grid; place-items: center; position: fixed; inset: 0; padding: 28px; background: var(--bg); }
-  .ed-mobile-inner { max-width: 380px; text-align: center; }
-  .ed-mobile-inner h3 { margin: 14px 0 10px; font-size: 22px; }
-  .ed-mobile-inner p { color: var(--muted); font-size: 14px; line-height: 1.65; margin-bottom: 20px; }
+
+/* ---------------------------------------------------------------------
+   768-1023px — one panel at a time, tab bar along the bottom
+   ------------------------------------------------------------------ */
+.ed-tabbar { display: none; }
+
+.ed.mode-single { --ed-stage-pad: var(--s3); }
+.ed.mode-single .ed-body { flex-direction: column; }
+.ed.mode-single .ed-stage { flex: none; height: clamp(280px, 44vh, 420px); order: 0; }
+.ed.mode-single .ed-side { width: 100%; flex: 1; min-height: 0; order: 1;
+  border-top: 1px solid var(--border); border-left: none; border-right: none; }
+.ed.mode-single .ed-side-right { position: static; transform: none; visibility: visible; box-shadow: none; }
+.ed.mode-single .ed-tabbar { display: flex; flex: none; background: var(--panel); border-top: 1px solid var(--border);
+  padding-bottom: env(safe-area-inset-bottom, 0px); }
+.ed-tabbar-btn { flex: 1; min-height: 56px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+  background: none; border: none; border-top: 2px solid transparent; color: var(--muted); font-size: 11px; font-weight: 600; }
+.ed-tabbar-btn.is-active { color: var(--cyan); border-top-color: var(--cyan); background: rgba(9,246,255,.06); }
+.ed-tabbar-icon { font-size: 17px; line-height: 1; }
+
+/* ---------------------------------------------------------------------
+   Below 768px the route renders Quick Edit instead, but the editor can
+   still be forced with ?full=1 — make sure it degrades rather than breaks.
+   ------------------------------------------------------------------ */
+@media (max-width: 767px) {
+  .ed-top { flex-wrap: wrap; row-gap: var(--s2); }
+  .ed-top-mid { margin: 0; text-align: left; align-items: flex-start; order: 3; width: 100%; }
+  .ed-project-name { text-align: left; padding-left: 0; width: 100%; max-width: none; }
+  .ed-top-projects { display: none; }
+  .ed-sheet-host { padding: 0; place-items: stretch; }
+  .ed-sheet { width: 100% !important; max-width: none; max-height: 100dvh; height: 100dvh; border-radius: 0 !important;
+    border: none !important; overflow-y: auto; }
+  .ed-stage { height: auto; min-height: 240px; }
 }
 `

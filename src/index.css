@@ -8,8 +8,41 @@
   --cyan: #09f6ff;
   --purple: #9b5dff;
   --pink: #ff2566;
+  --green: #7cffb2;
+  --amber: #ffcf8a;
   --text: #eeeeff;
-  --muted: #6464a0;
+
+  /* Text-bearing muted. #6464a0 measured 3.6:1 on --panel, under the 4.5:1
+     floor; this clears 4.5:1 on --bg, --panel AND --surface. The old value
+     lives on as --muted-line for borders and dots, which carry no text. */
+  --muted: #8484c0;
+  --muted-line: #6464a0;
+
+  /* Spacing scale. Every gap/padding in the app comes from these — ad-hoc
+     pixel values are what made the UI read as a wireframe. */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s6: 24px;
+  --s8: 32px;
+  --s12: 48px;
+
+  --r-sm: 6px;
+  --r-md: 9px;
+  --r-lg: 14px;
+  --r-xl: 18px;
+
+  /* Panel geometry — fluid, not fixed px. The editor overrides these per
+     breakpoint rather than restating widths in a dozen rules. */
+  --side-w: clamp(210px, 17vw, 268px);
+  --rail-w: 48px;
+  --timeline-h: 158px;
+
+  /* Touch target floors. Coarse pointers get 44px, mice get 32px. */
+  --tap: 32px;
+
+  --ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--cyan);
 
   color-scheme: dark;
   font-family: 'DM Sans', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
@@ -17,8 +50,20 @@
   background: var(--bg);
 }
 
+@media (pointer: coarse) {
+  :root {
+    --tap: 44px;
+  }
+}
+
 * {
   box-sizing: border-box;
+}
+
+/* A component that sets its own `display` would otherwise beat the UA's
+   [hidden] rule, leaving hidden panels on screen. */
+[hidden] {
+  display: none !important;
 }
 
 html,
@@ -29,10 +74,19 @@ body,
   min-height: 100%;
 }
 
+html,
+body {
+  /* No page in this app scrolls sideways. Anything that overflows scrolls
+     inside its own container instead. */
+  max-width: 100%;
+  overflow-x: hidden;
+}
+
 body {
   background: var(--bg);
   color: var(--text);
   -webkit-font-smoothing: antialiased;
+  overscroll-behavior-y: none;
 }
 
 h1,
@@ -61,6 +115,45 @@ textarea {
   font-family: inherit;
 }
 
+/* iOS zooms the whole page when a focused field is under 16px. Only touch
+   devices need the bump — forcing it on desktop would blow up the panels. */
+@media (pointer: coarse) {
+  input,
+  select,
+  textarea {
+    font-size: 16px;
+  }
+}
+
+/* Keyboard navigation was invisible before this: no element defined a focus
+   style, so :focus-visible fell through to nothing on custom-styled controls. */
+:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+  border-radius: var(--r-sm);
+}
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
@@ -74,4 +167,18 @@ textarea {
 }
 ::-webkit-scrollbar-thumb:hover {
   background: #2a2a42;
+}
+
+/* Reduced motion: kill the landing-page orbs, panel slides and every
+   transition. Progress bars keep their width change — that is information,
+   not decoration, but it is instant rather than eased. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
 }

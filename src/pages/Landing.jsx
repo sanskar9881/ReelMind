@@ -53,7 +53,7 @@ export default function Landing() {
             <a href="#features">Features</a>
             <a href="#pricing">Pricing</a>
           </div>
-          <Link to="/projects" className="lp-btn lp-btn-ghost lp-btn-sm">
+          <Link to="/projects" className="lp-btn lp-btn-ghost lp-btn-sm lp-nav-projects">
             Projects
           </Link>
           <Link to="/editor" className="lp-btn lp-btn-sm">
@@ -63,10 +63,10 @@ export default function Landing() {
       </nav>
 
       <header className="lp-hero">
-        <div className="lp-orb lp-orb-a" />
-        <div className="lp-orb lp-orb-b" />
-        <div className="lp-orb lp-orb-c" />
-        <div className="lp-grid-overlay" />
+        <div className="lp-orb lp-orb-a" aria-hidden="true" />
+        <div className="lp-orb lp-orb-b" aria-hidden="true" />
+        <div className="lp-orb lp-orb-c" aria-hidden="true" />
+        <div className="lp-grid-overlay" aria-hidden="true" />
         <div className="lp-wrap lp-hero-inner">
           <div className="lp-pill">AI vlog editor · runs entirely in your browser</div>
           <h1 className="lp-h1">
@@ -118,7 +118,7 @@ export default function Landing() {
           <div className="lp-features">
             {FEATURES.map((f) => (
               <div key={f.t} className="lp-feature">
-                <div className="lp-feature-dot" />
+                <div className="lp-feature-dot" aria-hidden="true" />
                 <h3>{f.t}</h3>
                 <p>{f.d}</p>
               </div>
@@ -182,60 +182,66 @@ export default function Landing() {
 }
 
 const CSS = `
-.lp { --maxw: 1140px; overflow-x: hidden; }
-.lp-wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 24px; }
+.lp { --maxw: 1140px; overflow-x: clip; max-width: 100vw; }
+.lp-wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 clamp(var(--s4), 4vw, var(--s6)); }
 
 .lp-nav { position: fixed; inset: 0 0 auto 0; z-index: 50; transition: background .3s, border-color .3s, backdrop-filter .3s; border-bottom: 1px solid transparent; }
 .lp-nav.is-scrolled { background: rgba(5,5,10,.72); backdrop-filter: blur(14px); border-bottom-color: var(--border); }
-.lp-nav-inner { display: flex; align-items: center; gap: 24px; height: 68px; }
+.lp-nav-inner { display: flex; align-items: center; gap: clamp(var(--s2), 2vw, var(--s6)); min-height: 68px; }
 .lp-logo { font-family: 'Syne', sans-serif; font-weight: 800; font-size: 20px; letter-spacing: -.03em; }
 .lp-logo span { background: linear-gradient(90deg, var(--cyan), var(--purple)); -webkit-background-clip: text; background-clip: text; color: transparent; }
-.lp-nav-links { display: flex; gap: 26px; margin-left: auto; margin-right: 8px; font-size: 14px; color: var(--muted); }
+.lp-nav-links { display: flex; gap: var(--s6); margin-left: auto; margin-right: var(--s2); font-size: 14px; color: var(--muted); }
 .lp-nav-links a:hover { color: var(--text); }
 
-.lp-btn { display: inline-flex; align-items: center; justify-content: center; border-radius: 10px; font-weight: 600; font-size: 14px; padding: 10px 18px; border: 1px solid transparent; background: linear-gradient(90deg, var(--cyan), var(--purple)); color: #05050a; transition: transform .15s, box-shadow .15s, background .15s; white-space: nowrap; }
+.lp-btn { display: inline-flex; align-items: center; justify-content: center; min-height: var(--tap); border-radius: var(--r-md); font-weight: 600; font-size: 14px;
+  padding: var(--s3) var(--s4); border: 1px solid transparent; background: linear-gradient(90deg, var(--cyan), var(--purple)); color: #05050a;
+  transition: transform .15s, box-shadow .15s, background .15s; white-space: nowrap; }
 .lp-btn:hover { transform: translateY(-1px); box-shadow: 0 8px 30px -8px rgba(155,93,255,.6); }
-.lp-btn-sm { padding: 8px 14px; }
-.lp-btn-lg { padding: 14px 26px; font-size: 15px; border-radius: 12px; }
+.lp-btn-sm { padding: var(--s2) var(--s3); font-size: 13px; }
+.lp-btn-lg { padding: var(--s4) var(--s6); font-size: 15px; border-radius: var(--r-lg); }
 .lp-btn-ghost { background: transparent; color: var(--text); border-color: var(--border); }
 .lp-btn-ghost:hover { border-color: var(--purple); box-shadow: none; }
 
-.lp-hero { position: relative; padding: 168px 0 100px; overflow: hidden; }
+.lp-hero { position: relative; padding: clamp(110px, 16vw, 168px) 0 clamp(56px, 9vw, 100px); overflow: hidden; }
 .lp-hero-inner { position: relative; z-index: 2; text-align: center; }
 .lp-orb { position: absolute; border-radius: 50%; filter: blur(90px); opacity: .5; z-index: 1; }
-.lp-orb-a { width: 480px; height: 480px; background: var(--purple); top: -120px; left: -80px; }
-.lp-orb-b { width: 420px; height: 420px; background: var(--cyan); top: 40px; right: -100px; opacity: .35; }
-.lp-orb-c { width: 360px; height: 360px; background: var(--pink); bottom: -160px; left: 40%; opacity: .28; }
+.lp-orb-a { width: min(480px, 90vw); height: min(480px, 90vw); background: var(--purple); top: -120px; left: -80px; animation: lp-float 17s ease-in-out infinite; }
+.lp-orb-b { width: min(420px, 80vw); height: min(420px, 80vw); background: var(--cyan); top: 40px; right: -100px; opacity: .35; animation: lp-float 21s ease-in-out infinite reverse; }
+.lp-orb-c { width: min(360px, 70vw); height: min(360px, 70vw); background: var(--pink); bottom: -160px; left: 40%; opacity: .28; animation: lp-float 25s ease-in-out infinite; }
+@keyframes lp-float { 0%, 100% { transform: none; } 50% { transform: translate3d(3%, -4%, 0) scale(1.06); } }
+/* Three blurred 480px orbs drifting behind text is exactly the motion this
+   setting exists to stop. */
+@media (prefers-reduced-motion: reduce) { .lp-orb { animation: none !important; } }
 .lp-grid-overlay { position: absolute; inset: 0; z-index: 1; background-image: linear-gradient(var(--border) 1px, transparent 1px), linear-gradient(90deg, var(--border) 1px, transparent 1px); background-size: 56px 56px; mask-image: radial-gradient(circle at 50% 40%, #000 0%, transparent 70%); opacity: .35; }
 
-.lp-pill { display: inline-block; font-size: 13px; color: var(--muted); border: 1px solid var(--border); background: var(--surface); border-radius: 999px; padding: 7px 16px; margin-bottom: 28px; }
+.lp-pill { display: inline-block; font-size: clamp(11.5px, 2.6vw, 13px); color: var(--muted); border: 1px solid var(--border); background: var(--surface); border-radius: 999px; padding: var(--s2) var(--s4); margin-bottom: var(--s6); }
 .lp-h1 { font-size: clamp(38px, 7vw, 76px); line-height: 1.03; font-weight: 800; }
 .lp-grad { background: linear-gradient(90deg, var(--cyan), var(--purple) 55%, var(--pink)); -webkit-background-clip: text; background-clip: text; color: transparent; }
-.lp-sub { max-width: 620px; margin: 26px auto 0; color: var(--muted); font-size: 18px; line-height: 1.6; }
-.lp-cta-row { display: flex; gap: 14px; justify-content: center; margin-top: 38px; flex-wrap: wrap; }
+.lp-sub { max-width: 620px; margin: var(--s6) auto 0; color: var(--muted); font-size: clamp(15px, 1.6vw, 18px); line-height: 1.6; }
+.lp-cta-row { display: flex; gap: var(--s3); justify-content: center; margin-top: var(--s8); flex-wrap: wrap; }
 
-.lp-stats { display: flex; gap: 14px; justify-content: center; margin-top: 64px; flex-wrap: wrap; }
-.lp-stat { border: 1px solid var(--border); background: var(--panel); border-radius: 14px; padding: 18px 26px; min-width: 130px; }
+.lp-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: var(--s3); margin-top: clamp(var(--s8), 6vw, 64px); max-width: 620px; margin-inline: auto; }
+.lp-stat { border: 1px solid var(--border); background: var(--panel); border-radius: var(--r-lg); padding: var(--s4) var(--s3); text-align: center; }
 .lp-stat-v { font-family: 'Syne', sans-serif; font-weight: 800; font-size: 26px; }
 .lp-stat-l { color: var(--muted); font-size: 13px; margin-top: 4px; }
 
-.lp-section { padding: 96px 0; }
+.lp-section { padding: clamp(56px, 9vw, 96px) 0; }
 .lp-section-alt { background: var(--panel); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
-.lp-h2 { font-size: clamp(28px, 4.5vw, 44px); text-align: center; margin-bottom: 56px; }
+.lp-h2 { font-size: clamp(26px, 4.5vw, 44px); text-align: center; margin-bottom: clamp(var(--s8), 5vw, 56px); }
 
-.lp-steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px; }
-.lp-step { border: 1px solid var(--border); background: var(--surface); border-radius: 16px; padding: 30px; }
+.lp-steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s6); }
+.lp-step { border: 1px solid var(--border); background: var(--surface); border-radius: var(--r-xl); padding: clamp(var(--s4), 3vw, var(--s8)); }
 .lp-step-n { font-family: 'Syne', sans-serif; font-weight: 800; font-size: 30px; background: linear-gradient(90deg, var(--cyan), var(--purple)); -webkit-background-clip: text; background-clip: text; color: transparent; }
 .lp-step h3 { margin: 16px 0 10px; font-size: 20px; }
 .lp-step p, .lp-feature p { color: var(--muted); font-size: 14.5px; line-height: 1.6; margin: 0; }
 
-.lp-features { display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px; }
-.lp-feature { border: 1px solid var(--border); background: var(--surface); border-radius: 16px; padding: 28px; }
+.lp-features { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s6); }
+.lp-feature { border: 1px solid var(--border); background: var(--surface); border-radius: var(--r-xl); padding: clamp(var(--s4), 3vw, var(--s6)); }
 .lp-feature-dot { width: 12px; height: 12px; border-radius: 50%; background: linear-gradient(90deg, var(--cyan), var(--purple)); box-shadow: 0 0 16px var(--purple); }
 .lp-feature h3 { margin: 16px 0 10px; font-size: 18px; }
 
-.lp-tiers { display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px; align-items: start; }
-.lp-tier { position: relative; border: 1px solid var(--border); background: var(--surface); border-radius: 18px; padding: 32px; }
+.lp-tiers { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s6); align-items: start; }
+.lp-tier { position: relative; border: 1px solid var(--border); background: var(--surface); border-radius: var(--r-xl); padding: clamp(var(--s4), 3vw, var(--s8)); }
 .lp-tier.is-hot { border-color: var(--purple); box-shadow: 0 0 0 1px var(--purple), 0 20px 60px -20px rgba(155,93,255,.45); transform: translateY(-8px); }
 .lp-tier-badge { position: absolute; top: -12px; left: 50%; transform: translateX(-50%); font-size: 12px; font-weight: 600; padding: 5px 14px; border-radius: 999px; background: linear-gradient(90deg, var(--cyan), var(--purple)); color: #05050a; }
 .lp-tier-name { font-family: 'Syne', sans-serif; font-weight: 700; font-size: 18px; }
@@ -250,14 +256,28 @@ const CSS = `
 .lp-closing-inner .lp-h2 { margin-bottom: 34px; }
 
 .lp-footer { border-top: 1px solid var(--border); padding: 44px 0; background: var(--panel); }
-.lp-footer-inner { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
-.lp-footer-cols { display: flex; gap: 22px; font-size: 14px; color: var(--muted); }
+.lp-footer-inner { display: flex; align-items: center; gap: var(--s4); flex-wrap: wrap; }
+.lp-footer-cols { display: flex; gap: var(--s4); font-size: 14px; color: var(--muted); flex-wrap: wrap; }
 .lp-footer-cols a:hover { color: var(--text); }
 .lp-footer-fine { margin-left: auto; color: var(--muted); font-size: 13px; }
 
-@media (max-width: 900px) {
-  .lp-steps, .lp-features, .lp-tiers { grid-template-columns: 1fr; }
-  .lp-tier.is-hot { transform: none; }
+/* 3 columns at desktop, 2 at tablet, 1 on a phone — the same ladder the
+   projects grid uses, so the site reflows predictably. */
+@media (max-width: 1023px) {
   .lp-nav-links { display: none; }
+  .lp-steps, .lp-features { grid-template-columns: repeat(2, 1fr); }
+  .lp-tiers { grid-template-columns: 1fr; }
+  .lp-tier.is-hot { transform: none; }
+}
+@media (max-width: 767px) {
+  .lp-steps, .lp-features { grid-template-columns: 1fr; }
+  .lp-footer-inner { flex-direction: column; align-items: flex-start; }
+  .lp-footer-fine { margin-left: 0; }
+}
+/* At 320px the logo plus two buttons will not fit on one line; the Projects
+   link is reachable from the editor and the footer, so it is the one to drop. */
+@media (max-width: 400px) {
+  .lp-nav-projects { display: none; }
+  .lp-cta-row .lp-btn { width: 100%; }
 }
 `
