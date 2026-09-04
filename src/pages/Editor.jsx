@@ -9,6 +9,17 @@ import { render, estimateRenderSeconds, applyCutRanges } from '../utils/videoPro
 import { checkWebCodecsSupport } from '../utils/webcodecs/support.js'
 import { verifyRender, measureSync } from '../utils/verify.js'
 import { buildCaptions, remapToOutputTimeline, toSRT, toVTT } from '../utils/captions.js'
+import {
+  analyzeEditedVideo,
+  buildProfile,
+  describeProfile,
+  listProfiles,
+  getActiveProfile,
+  setActiveProfile,
+  saveProfile,
+  renameProfile,
+  deleteProfile,
+} from '../utils/styleProfile.js'
 
 const PX_PER_SEC = 26
 
@@ -31,6 +42,15 @@ export default function Editor() {
   const [removeFillers, setRemoveFillers] = useState(false)
   const [retakeChoice, setRetakeChoice] = useState({}) // { [clipId]: { [groupId]: sentenceIndex } }
   const [keepAllTakes, setKeepAllTakes] = useState(false)
+
+  // Style profiles — the creator's own editing rhythm, learned from past uploads.
+  const [profiles, setProfiles] = useState(() => listProfiles())
+  const [activeProfileId, setActiveProfileId] = useState(() => getActiveProfile()?.id ?? null)
+  const [applyStyle, setApplyStyle] = useState(true)
+  const [styleAnalyzing, setStyleAnalyzing] = useState(null) // { index, total, pct, msg }
+  const [styleError, setStyleError] = useState('')
+  const styleInputRef = useRef(null)
+  const [styleDragging, setStyleDragging] = useState(false)
 
   // Captions — built from transcript word timings, optionally burned into video.
   const [burnCaptions, setBurnCaptions] = useState(false)
@@ -91,6 +111,63 @@ export default function Editor() {
   )
 
   const hasCaptions = Object.keys(captionCuesByClip).length > 0
+
+  const activeProfile = useMemo(
+    () => profiles.find((p) => p.id === activeProfileId) || null,
+    [profiles, activeProfileId],
+  )
+
+  // Analyze 1-5 finished past uploads into a profile.
+  const ingestStyleVideos = useCallback(
+    async (fileList) => {
+      const files = Array.from(fileList || [])
+        .filter((f) => f.type.startsWith('video/'))
+        .slice(0, 5)
+      if (!files.length) return
+      setStyleError('')
+      const analyses = []
+      try {
+        for (let i = 0; i < files.length; i++) {
+          setStyleAnalyzing({ index: i, total: files.length, pct: 0, msg: `Loading ${files[i].name}…` })
+          const a = await analyzeEditedVideo(files[i], (p) =>
+            setStyleAnalyzing({ index: i, total: files.length, pct: p.pct, msg: p.msg }),
+          )
+          analyses.push(a)
+        }
+        const profile = buildProfile(analyses, `Style ${profiles.length + 1}`)
+        saveProfile(profile)
+        setProfiles(listProfiles())
+        setActiveProfileId(getActiveProfile()?.id ?? profile.id)
+      } catch (err) {
+        setStyleError(err?.message || 'Could not analyze those videos.')
+      } finally {
+        setStyleAnalyzing(null)
+      }
+    },
+    [profiles.length],
+  )
+
+  const chooseProfile = useCallback((id) => {
+    setActiveProfile(id)
+    setActiveProfileId(id)
+  }, [])
+
+  const doRenameProfile = useCallback(
+    (id) => {
+      const current = profiles.find((p) => p.id === id)
+      const next = window.prompt('Rename this style profile', current?.name || '')
+      if (next == null) return
+      renameProfile(id, next.trim())
+      setProfiles(listProfiles())
+    },
+    [profiles],
+  )
+
+  const doDeleteProfile = useCallback((id) => {
+    deleteProfile(id)
+    setProfiles(listProfiles())
+    setActiveProfileId(getActiveProfile()?.id ?? null)
+  }, [])
 
   // Burn-in works on both engines: the GPU compositor draws captions on canvas,
   // and the FFmpeg core does ship libass (it just needs a font handed to it).
@@ -389,7 +466,13 @@ export default function Editor() {
     setAiError('')
     setPlan(null)
     try {
-      const p = await generateEditPlan(clips, prompt, analysis, transcriptsMap)
+      const p = await generateEditPlan(
+        clips,
+        prompt,
+        analysis,
+        transcriptsMap,
+        applyStyle ? activeProfile : null,
+      )
       applyTextEdits(p)
       setPlan(p)
       setAiState('done')
@@ -397,7 +480,7 @@ export default function Editor() {
       setAiError(err.message || 'Planning failed.')
       setAiState('error')
     }
-  }, [clips, prompt, aiState, analysis, transcriptsMap, applyTextEdits])
+  }, [clips, prompt, aiState, analysis, transcriptsMap, applyTextEdits, applyStyle, activeProfile])
 
   // ---- render -----------------------------------------------------------
   const diagLog = useCallback((d) => {
@@ -603,7 +686,7 @@ export default function Editor() {
         {/* LEFT SIDEBAR */}
         <aside className="ed-side ed-side-left">
           <div className="ed-tabs">
-            {['clips', 'transcript', 'music', 'fx'].map((t) => (
+            {['clips', 'transcript', 'style', 'music', 'fx'].map((t) => (
               <button
                 key={t}
                 className={`ed-tab${leftTab === t ? ' is-active' : ''}`}
@@ -993,6 +1076,146 @@ export default function Editor() {
                         : 'Transcribe a clip to generate captions.'}
                     </p>
                   </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {leftTab === 'style' && (
+            <div className="ed-side-scroll">
+              {styleAnalyzing ? (
+                <div className="ed-style-progress">
+                  <p className="ed-style-lead">
+                    Analyzing video {styleAnalyzing.index + 1} of {styleAnalyzing.total}
+                  </p>
+                  <div className="ed-prog-bar">
+                    <div className="ed-prog-fill" style={{ width: `${styleAnalyzing.pct}%` }} />
+                  </div>
+                  <p className="ed-dim ed-mt">{styleAnalyzing.msg}</p>
+                  <p className="ed-dim">
+                    Frames are sampled 4× a second, so a long video takes a while. This is working,
+                    not stuck.
+                  </p>
+                </div>
+              ) : !profiles.length ? (
+                <>
+                  <p className="ed-style-lead">Teach ReelMind your editing rhythm.</p>
+                  <p className="ed-dim">
+                    Drop in a few videos you have already edited and published. ReelMind measures how
+                    long you hold a shot, how long your opening hook runs, how often you cut hard
+                    versus transition, and whether you speed up or settle as the video goes on — then
+                    edits new footage to match.
+                  </p>
+                  <p className="ed-dim ed-mt">
+                    Nothing is uploaded. The videos are read locally and only the rhythm numbers are
+                    kept.
+                  </p>
+                  <div
+                    className={`ed-drop ed-mt${styleDragging ? ' is-drag' : ''}`}
+                    onDragOver={(e) => {
+                      e.preventDefault()
+                      setStyleDragging(true)
+                    }}
+                    onDragLeave={() => setStyleDragging(false)}
+                    onDrop={(e) => {
+                      e.preventDefault()
+                      setStyleDragging(false)
+                      if (e.dataTransfer?.files?.length) ingestStyleVideos(e.dataTransfer.files)
+                    }}
+                    onClick={() => styleInputRef.current?.click()}
+                    role="button"
+                    tabIndex={0}
+                  >
+                    <div className="ed-drop-icon">✦</div>
+                    <div className="ed-drop-t">Add 1-5 of your past edited videos</div>
+                    <div className="ed-drop-d">drop here or click to browse</div>
+                    <input
+                      ref={styleInputRef}
+                      type="file"
+                      multiple
+                      accept="video/*"
+                      hidden
+                      onChange={(e) => {
+                        if (e.target.files?.length) ingestStyleVideos(e.target.files)
+                        e.target.value = ''
+                      }}
+                    />
+                  </div>
+                  {styleError && <div className="ed-bad ed-mt">{styleError}</div>}
+                </>
+              ) : (
+                <>
+                  {profiles.length > 1 && (
+                    <label className="ed-field">
+                      <span>Profile</span>
+                      <select value={activeProfileId || ''} onChange={(e) => chooseProfile(e.target.value)}>
+                        {profiles.map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+
+                  {activeProfile && (
+                    <>
+                      <div className="ed-style-card">
+                        <div className="ed-style-name">{activeProfile.name}</div>
+                        <p className="ed-style-desc">Your style: {describeProfile(activeProfile)}</p>
+                        <p className="ed-dim">
+                          From {activeProfile.sourceCount} video
+                          {activeProfile.sourceCount === 1 ? '' : 's'} ·{' '}
+                          {Math.round((1 - activeProfile.transitionRatio) * 100)}% hard cuts · shots
+                          usually {activeProfile.p25ShotLength.toFixed(1)}–
+                          {activeProfile.p75ShotLength.toFixed(1)}s
+                        </p>
+                      </div>
+
+                      {activeProfile.confidence < 0.35 && (
+                        <div className="ed-warn">
+                          Low confidence — the cut detector struggled with this footage. The profile
+                          may not reflect your real rhythm.
+                        </div>
+                      )}
+
+                      <label className="ed-toggle ed-mt">
+                        <input
+                          type="checkbox"
+                          checked={applyStyle}
+                          onChange={(e) => setApplyStyle(e.target.checked)}
+                        />
+                        <span>Apply my style to new edits</span>
+                      </label>
+                      <p className="ed-dim">
+                        Say “ignore my style” in the prompt to skip it for one edit.
+                      </p>
+
+                      <div className="ed-style-actions">
+                        <button className="ed-btn ed-btn-sm" onClick={() => styleInputRef.current?.click()}>
+                          Rebuild
+                        </button>
+                        <button className="ed-btn ed-btn-sm" onClick={() => doRenameProfile(activeProfile.id)}>
+                          Rename
+                        </button>
+                        <button className="ed-btn ed-btn-sm" onClick={() => doDeleteProfile(activeProfile.id)}>
+                          Delete
+                        </button>
+                      </div>
+                      <input
+                        ref={styleInputRef}
+                        type="file"
+                        multiple
+                        accept="video/*"
+                        hidden
+                        onChange={(e) => {
+                          if (e.target.files?.length) ingestStyleVideos(e.target.files)
+                          e.target.value = ''
+                        }}
+                      />
+                      {styleError && <div className="ed-bad ed-mt">{styleError}</div>}
+                    </>
+                  )}
                 </>
               )}
             </div>
@@ -1578,6 +1801,15 @@ const CSS = `
 /* captions */
 .ed-caps { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 9px; }
 .ed-caps-head { font-weight: 600; }
+/* style profiles */
+.ed-style-lead { font-size: 13px; font-weight: 600; color: var(--text); margin: 0 0 8px; }
+.ed-style-progress { display: flex; flex-direction: column; gap: 4px; }
+.ed-style-card { margin-top: 12px; padding: 11px; border-radius: 10px; border: 1px solid var(--purple); background: rgba(155,93,255,.08); }
+.ed-style-name { font-family: 'Syne', sans-serif; font-weight: 700; font-size: 13px; margin-bottom: 5px; }
+.ed-style-desc { font-size: 12px; line-height: 1.55; color: var(--text); margin: 0 0 6px; }
+.ed-style-actions { display: flex; gap: 6px; margin-top: 12px; }
+.ed-style-actions .ed-btn { flex: 1; padding: 6px 4px; }
+
 .ed-caps-note { margin: 5px 0 0; font-size: 10.5px; line-height: 1.5; color: #ffcf8a; }
 .ed-caps-note.is-info { color: var(--muted); }
 .ed-toggle.is-disabled { opacity: .55; cursor: not-allowed; }

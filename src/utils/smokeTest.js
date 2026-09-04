@@ -10,6 +10,7 @@ import { analyzeAll } from './analyzer.js'
 import { generateEditPlan } from './ai.js'
 import { render, applyCutRanges, resolveJoinPath } from './videoProcessor.js'
 import { remapToOutputTimeline } from './captions.js'
+import { analyzeEditedVideo, buildProfile, describeProfile } from './styleProfile.js'
 import { verifyRender, measureSync } from './verify.js'
 
 function pickMime() {

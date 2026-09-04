@@ -1,6 +1,7 @@
 // ai.js — edit-plan generation. Mock-only for now (no API spend until tested).
 
 import { findRetakes, extendTakeRange } from './retakes.js'
+import { applyProfile, describePacing } from './styleProfile.js'
 
 export const USE_MOCK = true
 
@@ -8,7 +9,7 @@ export const USE_MOCK = true
  * Build the Claude prompt string. Lists the clip inventory as JSON, states the
  * user's request, and demands ONLY the plan JSON back (no markdown fences).
  */
-export function buildPrompt(clips, userPrompt, transcripts) {
+export function buildPrompt(clips, userPrompt, transcripts, profile) {
   const T = transcripts instanceof Map ? transcripts : null
 
   const inventory = clips.map((c) => {
@@ -87,6 +88,15 @@ RULES:
 - Sentences listed under the same retake group are repeated attempts at one
   line. Use exactly one. Prefer the recommended take.`
       : ''
+  }${
+    profile
+      ? `
+- The creator's own editing rhythm, measured from their past videos: median
+  shot length ${profile.medianShotLength.toFixed(1)}s, opening shot
+  ${profile.openingShotLength.toFixed(1)}s, ${Math.round((1 - (profile.transitionRatio || 0)) * 100)}% hard cuts,
+  pacing — ${describePacing(profile.pacingCurve)}. Match this rhythm unless the
+  request explicitly asks otherwise.`
+      : ''
   }`
 }
 
@@ -95,6 +105,7 @@ const RX_SLOW = /slow|calm|chill|cinematic|moody/i
 const RX_SORT = /best|longest|scenic|hook/i
 const RX_FILLERS = /(remove|cut|kill|no)\s+(filler|um|uh|filler words)/i
 const RX_KEEP_TAKES = /keep all takes|all takes|don'?t remove retakes/i
+const RX_NO_STYLE = /ignore my style|default style|no style/i
 
 /**
  * If the prompt asks for filler removal and we have transcripts, flag the plan
@@ -374,19 +385,30 @@ function stripFences(text) {
  * Generate an edit plan. Mock path awaits ~900ms then validates mockPlan().
  * Real path POSTs to /api/plan (a serverless function that holds the key) and
  * parses the returned text. The key never reaches the client bundle.
+ *
+ * `profile` is optional. It reaches BOTH paths: as context inside buildPrompt so
+ * the model can reason about the rhythm, and as a post-validation bias so it
+ * still works in mock mode with no API. `/(ignore my style|default style|no
+ * style)/` opts out of both.
  */
-export async function generateEditPlan(clips, userPrompt, analysis, transcripts) {
+export async function generateEditPlan(clips, userPrompt, analysis, transcripts, profile) {
   if (!clips || !clips.length) throw new Error('Add at least one clip before generating a plan.')
+
+  const styleOn = profile && !RX_NO_STYLE.test(userPrompt || '')
+  const ctx = { analysis, clips }
 
   if (USE_MOCK) {
     await new Promise((r) => setTimeout(r, 900))
-    return validatePlan(mockPlan(clips, userPrompt, analysis, transcripts), clips)
+    const plan = validatePlan(mockPlan(clips, userPrompt, analysis, transcripts), clips)
+    return styleOn ? applyProfile(plan, profile, ctx) : plan
   }
 
   const res = await fetch('/api/plan', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt: buildPrompt(clips, userPrompt, transcripts) }),
+    body: JSON.stringify({
+      prompt: buildPrompt(clips, userPrompt, transcripts, styleOn ? profile : null),
+    }),
   })
   if (!res.ok) throw new Error(`Planning service failed (${res.status}).`)
   const data = await res.json()
@@ -401,5 +423,8 @@ export async function generateEditPlan(clips, userPrompt, analysis, transcripts)
   // too, not just the mock's.
   attachRetakeRemoval(parsed, clips, userPrompt, transcripts)
   attachFillerRemoval(parsed, clips, userPrompt, transcripts)
-  return validatePlan(parsed, clips)
+  const plan = validatePlan(parsed, clips)
+  // The model already saw the profile in the prompt; this is the safety net that
+  // pulls a drifting response back onto the creator's measured rhythm.
+  return styleOn ? applyProfile(plan, profile, ctx) : plan
 }

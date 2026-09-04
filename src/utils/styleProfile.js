@@ -49,8 +49,31 @@ function loadVideo(url) {
     v.playsInline = true
     v.preload = 'auto'
     v.src = url
-    v.onloadeddata = () => resolve(v)
     v.onerror = () => reject(new Error('could not decode this video'))
+    v.onloadeddata = () => {
+      // MediaRecorder WebM reports duration: Infinity until seeked past the end.
+      // A creator's own export is very often exactly that.
+      if (isFinite(v.duration)) return resolve(v)
+      const onTime = () => {
+        v.removeEventListener('timeupdate', onTime)
+        const rewind = () => {
+          v.removeEventListener('seeked', rewind)
+          resolve(v)
+        }
+        v.addEventListener('seeked', rewind)
+        try {
+          v.currentTime = 0
+        } catch {
+          resolve(v)
+        }
+      }
+      v.addEventListener('timeupdate', onTime)
+      try {
+        v.currentTime = 1e101
+      } catch {
+        resolve(v)
+      }
+    }
   })
 }
 
