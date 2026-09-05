@@ -7,7 +7,8 @@
 
 import { probeAll } from './videoMeta.js'
 import { analyzeAll } from './analyzer.js'
-import { generateEditPlan } from './ai.js'
+import { generateEditPlan, mockPlan, resolveTargetDuration } from './ai.js'
+import { keepRatioFor } from './candidates.js'
 import { render, applyCutRanges, resolveJoinPath } from './videoProcessor.js'
 import { remapToOutputTimeline } from './captions.js'
 import { analyzeEditedVideo, buildProfile, describeProfile } from './styleProfile.js'
@@ -314,17 +315,130 @@ function median(xs) {
 }
 
 /**
+ * Selection math at three scales, with no footage and no render — pure planner.
+ *
+ * This is the check that the old flat "20% of footage, minimum 60s" never could
+ * have passed: a 15-second clip cannot yield 60 seconds, so selection chased a
+ * target it could not reach and returned a single 3-second fragment. Each case
+ * asserts the OUTPUT duration, because that is what the user watches.
+ */
+export function planScaleCheck(log = () => {}) {
+  // Synthetic analysis, not null: with no analysis every body candidate scores
+  // identically on position alone, they all tie, and mergeAbutting folds the
+  // whole clip into one block — a shape no real footage produces. Varying the
+  // audio and motion baselines gives selection something to actually choose
+  // between, which is what is under test.
+  const fakeAnalysis = (clips) => {
+    const A = {}
+    for (const c of clips) {
+      const audio = []
+      const motion = []
+      for (let t = 0; t < c.duration; t += 0.25) {
+        audio.push({ t: +t.toFixed(2), level: 0.45 + 0.35 * Math.sin(t * 0.9) * Math.cos(t * 0.13) })
+      }
+      for (let t = 0; t < c.duration; t += 0.5) {
+        motion.push({ t: +t.toFixed(2), score: 0.2 + 0.15 * Math.sin(t * 0.4 + 1) })
+      }
+      A[c.id] = {
+        audio: { hasAudio: true, energy: 0.45, windows: audio, silences: [], loudestAt: 0 },
+        motion: { windows: motion },
+        motionAvg: 0.2,
+        lumaAvg: 0.52,
+        contrastAvg: 0.48,
+      }
+    }
+    return A
+  }
+
+  const cases = [
+    {
+      name: '1 clip · 15s',
+      clips: [{ id: 'a', name: 'short-a.mp4', duration: 15, width: 1280, height: 720 }],
+      expect: { min: 10, max: 14, minSegs: 1, maxSegs: 2 },
+    },
+    {
+      name: '3 clips · 15s each',
+      clips: [1, 2, 3].map((i) => ({
+        id: `c${i}`,
+        name: `short-${i}.mp4`,
+        duration: 15,
+        width: 1280,
+        height: 720,
+      })),
+      expect: { min: 25, max: 38 },
+    },
+    {
+      name: '1 clip · 10min',
+      clips: [{ id: 'long', name: 'long.mp4', duration: 600, width: 1280, height: 720 }],
+      expect: { min: 120, max: 150 },
+    },
+  ]
+
+  const results = []
+  for (const c of cases) {
+    const footage = c.clips.reduce((a, x) => a + x.duration, 0)
+    let row
+    try {
+      const plan = mockPlan(c.clips, 'a vlog', fakeAnalysis(c.clips), null)
+      const out = plan.segments.reduce((a, s2) => a + (s2.end - s2.start), 0)
+      const segs = plan.segments.length
+      const target = resolveTargetDuration('a vlog', c.clips)
+      const durOk = out >= c.expect.min && out <= c.expect.max
+      const segOk =
+        (c.expect.minSegs == null || segs >= c.expect.minSegs) &&
+        (c.expect.maxSegs == null || segs <= c.expect.maxSegs)
+      row = { name: c.name, ok: durOk && segOk, out, segs, target, footage, durOk, segOk }
+    } catch (err) {
+      row = { name: c.name, ok: false, error: err?.message || String(err), footage }
+    }
+    results.push(row)
+
+    if (row.error) {
+      log(`  ✗ ${c.name}: ${row.error}`)
+      continue
+    }
+    const segTxt =
+      c.expect.minSegs == null
+        ? `${row.segs} segments`
+        : `${row.segs} segments (expect ${c.expect.minSegs}-${c.expect.maxSegs})`
+    log(
+      `  ${row.ok ? '✓' : '✗'} ${c.name}: kept ${row.out.toFixed(1)}s of ${footage}s ` +
+        `(${Math.round((row.out / footage) * 100)}%) — expect ${c.expect.min}-${c.expect.max}s · ${segTxt}`,
+    )
+    log(
+      `      keep ratio ${keepRatioFor(footage).toFixed(2)} · target ${row.target.toFixed(1)}s` +
+        `${row.durOk ? '' : '  ← duration out of range'}${row.segOk ? '' : '  ← segment count out of range'}`,
+    )
+  }
+
+  const ok = results.every((r) => r.ok)
+  log(`  ${ok ? '✓' : '✗'} selection scale: ${results.filter((r) => r.ok).length}/${results.length} cases`)
+  return { ok, cases: results }
+}
+
+/**
  * @param {(line:string)=>void} log
  * @param {(d:object)=>void} [onDiag]
  * @returns {Promise<{ok:boolean, results:object, mime:string, isMp4:boolean}>}
  */
 export async function runSmokeTest(log = () => {}, onDiag) {
   if (typeof MediaRecorder === 'undefined') {
-    log('✗ MediaRecorder is unavailable in this browser')
-    return { ok: false, results: {}, mime: '', isMp4: false }
+    log('✗ MediaRecorder is unavailable in this browser — running the planner checks only')
+    const scaleOnly = planScaleCheck(log)
+    return { ok: false, results: { planScale: scaleOnly }, mime: '', isMp4: false }
   }
 
-  // Style-profile cut detection runs FIRST: it is independent of the render
+  // Selection scale first — it is pure math, needs no recording, and it is the
+  // check that fails loudest when the keep ratio is retuned.
+  log('── planner: selection scale ──')
+  let scaleCheck = { ok: false }
+  try {
+    scaleCheck = planScaleCheck(log)
+  } catch (e) {
+    log(`  ✗ ${e?.message || e}`)
+  }
+
+  // Style-profile cut detection runs next: it is independent of the render
   // pipeline, and recording a fresh clip is more reliable before several
   // encoders have been spun up and torn down in this page.
   log('── style profile: cut detection accuracy ──')
@@ -377,6 +491,7 @@ export async function runSmokeTest(log = () => {}, onDiag) {
   const capCheck = await captionTimelineCheck(clips, onDiag, log)
   results.captionTimeline = capCheck
   results.styleProfile = styleCheck
+  results.planScale = scaleCheck
 
 
   clips.forEach((c) => URL.revokeObjectURL(c.url))
@@ -400,7 +515,11 @@ export async function runSmokeTest(log = () => {}, onDiag) {
   // (otherwise there is nothing for mp4box to demux — not a real failure).
   const capOk = !!capCheck.ffmpeg?.ok && (isMp4 ? !!capCheck.webcodecs?.ok : true)
   const overallOk =
-    !!results.ffmpeg?.ok && (isMp4 ? !!results.webcodecs?.ok : true) && capOk && !!styleCheck.ok
+    !!results.ffmpeg?.ok &&
+    (isMp4 ? !!results.webcodecs?.ok : true) &&
+    capOk &&
+    !!styleCheck.ok &&
+    !!scaleCheck.ok
   log(overallOk ? '✅ SMOKE TEST PASSED' : '❌ SMOKE TEST FAILED')
 
   return { ok: overallOk, results, mime, isMp4 }

@@ -4,7 +4,13 @@ import { probeAll, fmtTime, fmtSize } from '../utils/videoMeta.js'
 import { analyzeAll, withTranscript } from '../utils/analyzer.js'
 import { transcribeClip } from '../utils/transcribe.js'
 import { extendTakeRange } from '../utils/retakes.js'
-import { generateEditPlan, USE_MOCK, buildPrompt } from '../utils/ai.js'
+import {
+  generateEditPlan,
+  USE_MOCK,
+  buildPrompt,
+  buildCandidateSet,
+  PROMPT_CANDIDATE_CAP,
+} from '../utils/ai.js'
 import { render, estimateRenderSeconds, applyCutRanges } from '../utils/videoProcessor.js'
 import { checkWebCodecsSupport } from '../utils/webcodecs/support.js'
 import { verifyRender, measureSync } from '../utils/verify.js'
@@ -40,6 +46,16 @@ const LEFT_TABS = ['clips', 'transcript', 'candidates', 'style', 'music', 'fx']
 const MOBILE_TABS = ['clips', 'transcript', 'style', 'export']
 const TAB_ICON = { clips: '🎞', transcript: '💬', candidates: '☰', style: '✦', music: '♪', fx: '✧', edit: '✂', grade: '◑', export: '⬇' }
 const TAB_LABEL = { fx: 'FX', edit: 'Edit', grade: 'Grade', export: 'Export' }
+
+/**
+ * Seconds as a reader sees them: "12s" under a minute, "2:05" over it. fmtTime
+ * always renders m:ss, which turns a 12-second edit into "0:12" — right on a
+ * timeline, wrong in a sentence about how much footage survived.
+ */
+const fmtDur = (n) => {
+  const s = Math.round(n || 0)
+  return s < 60 ? `${s}s` : fmtTime(s)
+}
 const tabLabel = (t) => TAB_LABEL[t] || t[0].toUpperCase() + t.slice(1)
 
 export default function Editor() {
@@ -175,24 +191,28 @@ export default function Editor() {
   const promptStats = useMemo(() => {
     if (!import.meta.env.DEV || !clips.length) return null
     try {
-      const text = buildPrompt(clips, prompt, transcriptsMap, applyStyle ? activeProfile : null)
+      // Build the real candidate set — the prompt is now the scored menu, so
+      // measuring the old inventory shape would report a number we never send.
+      const set = buildCandidateSet(clips, prompt, analysis, transcriptsMap)
+      const text = buildPrompt(clips, prompt, transcriptsMap, applyStyle ? activeProfile : null, {
+        candidates: set.scored,
+        targetDuration: set.targetDuration,
+        footageSeconds: set.footageSeconds,
+      })
       const bytes = new TextEncoder().encode(text).length
-      const totalSentences = Object.values(transcripts).reduce(
-        (a, t) => a + (t?.sentences?.length || 0),
-        0,
-      )
       return {
         bytes,
         kb: bytes / 1024,
         tokens: Math.round(text.length / 3.6), // chars/3.6 ≈ Claude tokens
-        sampled: /"sentencesSampled": true/.test(text),
-        sentInPrompt: (text.match(/"text":/g) || []).length,
-        totalSentences,
+        generated: set.generated,
+        scored: set.scored.length,
+        inPrompt: Math.min(set.scored.length, PROMPT_CANDIDATE_CAP),
+        target: Math.round(set.targetDuration),
       }
     } catch {
       return null
     }
-  }, [clips, prompt, transcriptsMap, transcripts, applyStyle, activeProfile])
+  }, [clips, prompt, analysis, transcriptsMap, applyStyle, activeProfile])
 
   // Analyze 1-5 finished past uploads into a profile.
   const ingestStyleVideos = useCallback(
@@ -2400,9 +2420,8 @@ export default function Editor() {
                     ~{promptStats.tokens.toLocaleString()} tokens
                   </div>
                   <div className="ed-dim">
-                    {promptStats.totalSentences > 0
-                      ? `${promptStats.sentInPrompt} of ${promptStats.totalSentences} sentences${promptStats.sampled ? ' (sampled across full clip length)' : ''}`
-                      : 'no transcripts yet'}
+                    {promptStats.inPrompt} of {promptStats.scored} scored candidates sent (
+                    {promptStats.generated} generated) · target {promptStats.target}s
                     {promptStats.kb > 150 && ' · over the 150KB budget'}
                   </div>
                 </div>
@@ -2429,16 +2448,17 @@ export default function Editor() {
               {plan?.candidateStats && (
                 <div className="ed-selratio">
                   <div className="ed-selratio-main">
-                    Selected {plan.segments.length} moment{plan.segments.length === 1 ? '' : 's'} from{' '}
-                    {plan.candidateStats.generated} candidates, {fmtTime(plan.candidateStats.outputSeconds)}{' '}
-                    from {fmtTime(plan.candidateStats.footageSeconds)} of footage
+                    Kept {fmtDur(plan.candidateStats.outputSeconds)} of{' '}
+                    {fmtDur(plan.candidateStats.footageSeconds)}
+                    {plan.candidateStats.footageSeconds
+                      ? ` (${Math.round((plan.candidateStats.outputSeconds / plan.candidateStats.footageSeconds) * 100)}%)`
+                      : ''}
                   </div>
                   <div className="ed-dim">
-                    {plan.candidateStats.footageSeconds
-                      ? `${Math.round((plan.candidateStats.outputSeconds / plan.candidateStats.footageSeconds) * 100)}% kept`
-                      : ''}
+                    {plan.segments.length} moment{plan.segments.length === 1 ? '' : 's'} from{' '}
+                    {plan.candidateStats.generated} candidates
                     {' · target '}
-                    {fmtTime(plan.candidateStats.targetDuration)}
+                    {fmtDur(plan.candidateStats.targetDuration)}
                     {plan.candidateStats.underTarget ? ' · came in under it deliberately' : ''}
                     {plan.candidateStats.relaxed?.length
                       ? ` · relaxed ${plan.candidateStats.relaxed.join(', ')}`

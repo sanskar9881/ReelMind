@@ -15,6 +15,7 @@ import {
   orderSegments,
   buildContext,
   totalFootageSeconds,
+  keepRatioFor,
 } from './candidates.js'
 
 // Live. /api/plan holds ANTHROPIC_API_KEY; the key never reaches this bundle.
@@ -25,9 +26,12 @@ export const USE_MOCK = false
 /** Candidates sent to the model. Above this the payload stops paying for itself. */
 export const PROMPT_CANDIDATE_CAP = 150
 
-/** Editing is mostly removal: keep about a fifth of the footage by default. */
-export const DEFAULT_KEEP_RATIO = 0.2
-export const TARGET_MIN_SECONDS = 60
+/**
+ * Editing is mostly removal, but HOW MUCH removal scales with the footage —
+ * see keepRatioFor in candidates.js. There is deliberately no minimum target:
+ * the old 60s floor is unsatisfiable on a 15s clip, and chasing it was what
+ * turned short footage into one stray fragment.
+ */
 export const TARGET_MAX_SECONDS = 600
 
 /**
@@ -89,8 +93,11 @@ export function buildPrompt(clips, userPrompt, transcripts, profile, sel = {}) {
       score: +c.score.toFixed(3),
     }
     if (c.text) row.text = c.text
+    // A short clip offered whole — the shape the offline planner prefers for it.
+    if (c.continuous) row.whole = true
     return row
   })
+  const anyWhole = menu.some((c) => c.whole)
 
   // Retake groups — repeated attempts at one line — so the model uses just one.
   const T = transcripts instanceof Map ? transcripts : null
@@ -153,7 +160,14 @@ RULES:
   within the same clip.
 - Aim for roughly ${target} seconds total across all chosen segments. Being 20%
   under is much better than padding with weak material.
-- Not every clip must be used. Most footage should NOT make the cut.
+- Not every clip must be used. Most footage should NOT make the cut.${
+    anyWhole
+      ? `
+- A candidate marked "whole" is a SHORT clip offered as one continuous take with
+  its setup and its tail already trimmed. Prefer it over cutting that clip into
+  fragments — a 15-second clip is one moment, not three.`
+      : ''
+  }
 - The first segment is the hook: role "hook". The last is role "outro".
 - Order the middle roughly by clip order and timestamp so the story still reads.${
     anySpeech
@@ -300,22 +314,21 @@ function parseTargetSeconds(p) {
 }
 
 /**
- * Target output length. Stated in the prompt if the user said so; otherwise a
- * fifth of the footage, clamped.
+ * Target output length. An explicit duration in the prompt ("30 second reel",
+ * "2 minute vlog") always wins; otherwise the adaptive keep ratio decides.
  *
  * The default matters more than it looks. The old planner used nearly all of
  * the footage, which is exactly why its output felt raw — editing is mostly
- * removal, and a plan that keeps everything has not edited anything.
+ * removal, and a plan that keeps everything has not edited anything. The other
+ * failure mode is the opposite one: a flat fifth-of-the-footage rule with a 60s
+ * floor cannot be satisfied by a 15-second clip, and what came back was a
+ * 3-second fragment. The target never exceeds the footage that exists.
  */
 export function resolveTargetDuration(userPrompt, clips) {
   const stated = parseTargetSeconds(userPrompt || '')
   const footage = totalFootageSeconds(clips)
   if (stated != null) return Math.max(LIMIT_FLOOR, Math.min(stated, footage))
-  const ratio = footage * DEFAULT_KEEP_RATIO
-  return Math.max(
-    LIMIT_FLOOR,
-    Math.min(Math.max(ratio, Math.min(TARGET_MIN_SECONDS, footage)), TARGET_MAX_SECONDS, footage),
-  )
+  return Math.max(LIMIT_FLOOR, Math.min(footage * keepRatioFor(footage), TARGET_MAX_SECONDS, footage))
 }
 
 /** Never target less than a single usable shot. */
@@ -328,6 +341,8 @@ const LIMIT_FLOOR = 3
 export function buildCandidateSet(clips, userPrompt, analysis, transcripts, opts = {}) {
   const context = buildContext(clips, analysis, transcripts)
   const { candidates, generated } = generateCandidates(clips, analysis, transcripts, {
+    // Whether a short clip may be cut up at all — see shouldFragmentShortClip.
+    fastCut: RX_FAST.test(userPrompt || '') || /snappy|quick cuts?|fast cut/i.test(userPrompt || ''),
     ...opts,
     context,
   })
@@ -569,8 +584,9 @@ export async function generateEditPlan(clips, userPrompt, analysis, transcripts,
   const set = buildCandidateSet(clips, userPrompt, analysis, transcripts)
 
   const finish = (plan) => {
-    plan.candidates = set.scored
     const validated = validatePlan(plan, clips)
+    // Attached after validation, never inside the plan the caller persists —
+    // the editor pulls it into its own state and saves the plan without it.
     validated.candidates = set.scored
     return styleOn ? applyProfile(validated, profile, ctx) : validated
   }

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { probeAll, fmtTime, fmtSize } from '../utils/videoMeta.js'
 import { analyzeAll } from '../utils/analyzer.js'
-import { generateEditPlan, USE_MOCK } from '../utils/ai.js'
+import { generateEditPlan } from '../utils/ai.js'
 import { render, estimateRenderSeconds } from '../utils/videoProcessor.js'
 import { useToast } from '../ui/Toast.jsx'
 import { SkeletonRows } from '../ui/Empty.jsx'
@@ -130,11 +130,17 @@ export default function QuickEdit({ reason }) {
     setAiError('')
     setPlan(null)
     try {
-      const p = await generateEditPlan(clips, prompt, analysis, new Map(), null)
+      const full = await generateEditPlan(clips, prompt, analysis, new Map(), null)
+      // The candidate menu is large and mobile has nowhere to show it — keep it
+      // out of state rather than holding 400 scored objects on a phone.
+      const { candidates: _menu, ...p } = full
       p.planId = `plan_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`
       setPlan(p)
       setAiState('done')
-      toast.success('Edit planned', `${p.segments.length} shots`)
+      toast.success(
+        p.plannedBy === 'claude' ? 'Planned by Claude' : 'Planned offline',
+        `${p.segments.length} moments kept`,
+      )
     } catch (err) {
       setAiError(err.message || 'Planning failed.')
       setAiState('error')
@@ -317,7 +323,19 @@ export default function QuickEdit({ reason }) {
                 <p className="qe-dim">
                   {shots} shot{shots === 1 ? '' : 's'} · {fmtTime(outSeconds)} total ·{' '}
                   {plan.music === 'none' ? 'no music' : `${plan.music} music`}
-                  {USE_MOCK ? ' · mock planner' : ''}
+                </p>
+                {plan.candidateStats && (
+                  <p className="qe-dim">
+                    Selected from {plan.candidateStats.generated} candidate moments ·{' '}
+                    {fmtTime(plan.candidateStats.outputSeconds)} from{' '}
+                    {fmtTime(plan.candidateStats.footageSeconds)} of footage
+                  </p>
+                )}
+                <p className="qe-dim">
+                  <span className={`qe-planby${plan.plannedBy === 'claude' ? ' is-claude' : ''}`}>
+                    {plan.plannedBy === 'claude' ? 'Planned by Claude' : 'Offline planner'}
+                  </span>
+                  {plan.plannedBy !== 'claude' && plan.fallbackReason ? ` — ${plan.fallbackReason}` : ''}
                 </p>
                 {effective.trimmed && (
                   <p className="qe-warn">
@@ -452,6 +470,9 @@ const CSS = `
 .qe-planout:empty { display: none; }
 .qe-plan-title { display: block; font-family: 'Syne', sans-serif; font-size: 15px; }
 .qe-plan-reason { margin: var(--s1) 0 var(--s2); color: var(--text); font-size: 13px; line-height: 1.6; }
+.qe-planby { display: inline-block; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+  padding: 2px var(--s2); border-radius: 999px; border: 1px solid var(--muted-line); color: var(--muted); }
+.qe-planby.is-claude { border-color: var(--cyan); color: var(--cyan); background: rgba(9,246,255,.1); }
 
 .qe-facts { margin: 0; display: flex; flex-direction: column; gap: var(--s2); }
 .qe-facts > div { display: flex; justify-content: space-between; gap: var(--s3); font-size: 12.5px; padding-bottom: var(--s2); border-bottom: 1px solid var(--border); }

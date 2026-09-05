@@ -51,7 +51,7 @@ export const VISUAL_WEIGHTS = { motion: 0.4, contrast: 0.3, exposure: 0.3 }
 
 /** Candidate geometry. */
 export const LIMITS = {
-  minSeconds: 0.7, // matches the renderer's floor
+  minSeconds: 0.7, // matches the renderer's floor; scaled down on short clips (minSegmentSecondsFor)
   maxSeconds: 30, // a 3-sentence group can run long; past this it is not a "moment"
   maxCandidates: 400, // past this, scoring hundreds of clips gets slow
   sentenceWindow: 3, // 1..3 consecutive sentences
@@ -59,6 +59,7 @@ export const LIMITS = {
   noSpeechMax: 8,
   noSpeechStep: 1,
   snapTolerance: 0.5, // how far a boundary may move to reach an onset
+  absoluteMinSeconds: 0.4, // the segment length nothing goes below, however short the clip
 }
 
 /** The first slice of any clip is setup. This is where the old planner lived. */
@@ -70,9 +71,73 @@ export const POSITION = {
   bodyScore: 1,
 }
 
+/**
+ * How much of the footage an unstated-length edit keeps.
+ *
+ * A flat ratio is wrong at both ends of the scale: short footage is already
+ * dense (a 15s clip is one moment, and keeping a fifth of it returns a
+ * fragment), long footage is mostly filler. These are anchor points, linearly
+ * interpolated, so 29s and 31s of footage behave the same instead of stepping.
+ *
+ * The anchors are placed so each band stated in the spec holds inside its own
+ * range: <30s ≈ .85, 30s-2min ≈ .60, 2-10min ≈ .35, 10-30min ≈ .22, >30min .15.
+ */
+export const KEEP_RATIO_ANCHORS = [
+  [30, 0.85],
+  [120, 0.6],
+  [360, 0.35],
+  [600, 0.22],
+  [1800, 0.15],
+]
+
+/** Interpolated keep ratio for a given amount of raw footage. */
+export function keepRatioFor(footageSeconds) {
+  const f = Number.isFinite(footageSeconds) ? Math.max(0, footageSeconds) : 0
+  const A = KEEP_RATIO_ANCHORS
+  if (f <= A[0][0]) return A[0][1]
+  for (let i = 1; i < A.length; i++) {
+    const [x0, y0] = A[i - 1]
+    const [x1, y1] = A[i]
+    if (f <= x1) return y0 + ((f - x0) / (x1 - x0)) * (y1 - y0)
+  }
+  return A[A.length - 1][1]
+}
+
+/**
+ * A clip shorter than this is ONE moment, not a reel of them. Fragmenting a
+ * 15-second clip into 3-second cuts destroys it, so the default is a single
+ * continuous segment with the setup trimmed off the head and the reach-for-the-
+ * stop-button off the tail. Fragmenting is opt-in: the prompt asks for fast
+ * cutting, or analysis found an internal silence long enough to be worth cutting.
+ */
+export const SHORT_CLIP = {
+  thresholdSeconds: 20,
+  headFraction: 0.12,
+  headMaxSeconds: 3,
+  tailFraction: 0.08,
+  tailMaxSeconds: 2,
+  minKeepFraction: 0.5, // never trim a short clip below half of itself
+  silenceSeconds: 1.5, // an internal gap this long justifies cutting it out
+}
+
+/** Head/tail trim for a short clip's single continuous segment. */
+export function shortClipTrim(duration) {
+  const head = Math.min(duration * SHORT_CLIP.headFraction, SHORT_CLIP.headMaxSeconds)
+  const tail = Math.min(duration * SHORT_CLIP.tailFraction, SHORT_CLIP.tailMaxSeconds)
+  let start = head
+  let end = duration - tail
+  const floor = duration * SHORT_CLIP.minKeepFraction
+  if (end - start < floor) {
+    const mid = duration / 2
+    start = Math.max(0, mid - floor / 2)
+    end = Math.min(duration, mid + floor / 2)
+  }
+  return { start: +start.toFixed(3), end: +end.toFixed(3) }
+}
+
 /** Selection constraints, so one strong clip cannot become the whole edit. */
 export const SELECTION = {
-  secondsPerClipSlot: 20, // maxPerClip = ceil(target / 20)
+  secondsPerClipSlot: 20, // maxPerClip = ceil(target / 20) on long clips
   minGapWithinClip: 3,
   fillRatio: 0.9, // below this fraction of target, start relaxing
   /**
@@ -88,6 +153,45 @@ export const SELECTION = {
   minScoreRatio: 0.7,
   /** What minGapWithinClip relaxes DOWN to, never to zero. See mergeAbutting. */
   relaxedGap: 1,
+}
+
+/**
+ * Per-clip constraints. All three used to be flat numbers tuned for hours of
+ * footage, and on a 15-second clip they collectively allowed exactly one
+ * segment: ceil(target/20) == 1 slot, a 3s gap wider than anything that fits,
+ * and a 0.7s floor sized for a long take.
+ */
+export function maxPerClipFor(clipDuration, targetDuration) {
+  const d = Number.isFinite(clipDuration) ? clipDuration : Infinity
+  if (d < 20) return 3
+  if (d <= 60) return 4
+  return Math.max(2, Math.ceil((targetDuration || 0) / SELECTION.secondsPerClipSlot))
+}
+
+/** Minimum spacing between two selections inside one clip. */
+export function minGapFor(clipDuration) {
+  const d = Number.isFinite(clipDuration) ? clipDuration : Infinity
+  return Math.min(SELECTION.minGapWithinClip, d * 0.12)
+}
+
+/** Shortest usable segment for a clip of this length — never below 0.4s. */
+export function minSegmentSecondsFor(clipDuration) {
+  const d = Number.isFinite(clipDuration) ? clipDuration : Infinity
+  return Math.max(LIMITS.absoluteMinSeconds, Math.min(LIMITS.minSeconds, d * 0.06))
+}
+
+/**
+ * Does this short clip earn being cut into pieces? Only if the prompt asked for
+ * fast cutting, or there is an internal silence long enough that removing it is
+ * the point of the cut. Otherwise it stays one continuous shot.
+ */
+export function shouldFragmentShortClip(cx, opts = {}) {
+  if (opts.fastCut) return true
+  const d = cx?.duration || 0
+  return (cx?.silences || []).some(
+    (sil) =>
+      sil.end - sil.start >= SHORT_CLIP.silenceSeconds && sil.start > 0.5 && sil.end < d - 0.5,
+  )
 }
 
 /**
@@ -285,6 +389,52 @@ export function generateCandidates(clips, analysis, transcripts, opts = {}) {
   for (const clip of clips) {
     const cx = context.get(clip.id)
     const tr = T.get(clip.id)
+    const minLen = minSegmentSecondsFor(clip.duration)
+    const isShort = clip.duration < SHORT_CLIP.thresholdSeconds
+    const preferContinuous = isShort && !shouldFragmentShortClip(cx, opts)
+    const tag = (c) => ({
+      ...c,
+      clipDuration: clip.duration,
+      ...(preferContinuous ? { preferContinuous: true } : null),
+    })
+
+    // A short clip is one moment. Offer it whole (setup trimmed off the head,
+    // the reach for the stop button off the tail) alongside its fragments —
+    // selection prefers this one unless the clip earned being cut up.
+    if (isShort) {
+      let { start, end } = shortClipTrim(clip.duration)
+      if (cx?.hasTranscript) {
+        // Do not cut a sentence in half to save 0.4s of setup.
+        const sents = tr.sentences
+        const firstIn = sents.find((x) => x.end > start)
+        const lastIn = [...sents].reverse().find((x) => x.start < end)
+        if (firstIn && lastIn && lastIn.end > firstIn.start) {
+          start = Math.max(0, Math.min(firstIn.start, start))
+          end = Math.min(clip.duration, Math.max(lastIn.end, end))
+        }
+      }
+      if (end - start >= minLen && !insideExcluded(clip.id, start, end, excludeRanges)) {
+        out.push(
+          tag({
+            id: `${clip.id}:cont`,
+            clipId: clip.id,
+            clip: clip.name,
+            start: +start.toFixed(3),
+            end: +Math.min(end, clip.duration).toFixed(3),
+            continuous: true,
+            ...(cx?.hasTranscript
+              ? {
+                  text: tr.sentences
+                    .filter((x) => x.start < end && x.end > start)
+                    .map((x) => x.text)
+                    .join(' ')
+                    .trim(),
+                }
+              : null),
+          }),
+        )
+      }
+    }
 
     if (cx?.hasTranscript) {
       const sents = tr.sentences
@@ -294,9 +444,9 @@ export function generateCandidates(clips, analysis, transcripts, opts = {}) {
           const start = group[0].start
           const end = group[group.length - 1].end
           const len = end - start
-          if (len < LIMITS.minSeconds || len > LIMITS.maxSeconds) continue
+          if (len < minLen || len > LIMITS.maxSeconds) continue
           if (insideExcluded(clip.id, start, end, excludeRanges)) continue
-          out.push({
+          out.push(tag({
             id: `${clip.id}:s${i}:${k}`,
             clipId: clip.id,
             clip: clip.name,
@@ -304,7 +454,7 @@ export function generateCandidates(clips, analysis, transcripts, opts = {}) {
             end: +Math.min(end, clip.duration).toFixed(3),
             text: group.map((s) => s.text).join(' ').trim(),
             sentenceIndices: group.map((_, j) => i + j),
-          })
+          }))
         }
       }
       continue
@@ -312,28 +462,31 @@ export function generateCandidates(clips, analysis, transcripts, opts = {}) {
 
     // No speech to cut on — slide a window and let the onsets place the edges.
     const onsets = cx?.onsets || []
+    // On a short clip the 2s floor is most of the clip; scale the shortest
+    // window down with it so a 6-second clip still offers real choices.
+    const winMin = Math.max(minLen, Math.min(LIMITS.noSpeechMin, clip.duration * 0.15))
     for (
-      let len = LIMITS.noSpeechMin;
+      let len = winMin;
       len <= LIMITS.noSpeechMax;
       len += LIMITS.noSpeechStep
     ) {
       for (let t = 0; t + len <= clip.duration + 1e-6; t += LIMITS.noSpeechStep) {
         let start = snap(t, onsets)
         let end = snap(t + len, onsets)
-        if (end - start < LIMITS.minSeconds) {
+        if (end - start < minLen) {
           start = t
           end = Math.min(clip.duration, t + len)
         }
         end = Math.min(end, clip.duration)
-        if (end - start < LIMITS.minSeconds || end - start > LIMITS.maxSeconds) continue
+        if (end - start < minLen || end - start > LIMITS.maxSeconds) continue
         if (insideExcluded(clip.id, start, end, excludeRanges)) continue
-        out.push({
-          id: `${clip.id}:w${t.toFixed(0)}:${len}`,
+        out.push(tag({
+          id: `${clip.id}:w${t.toFixed(0)}:${len.toFixed(1)}`,
           clipId: clip.id,
           clip: clip.name,
           start: +start.toFixed(3),
           end: +end.toFixed(3),
-        })
+        }))
       }
     }
   }
@@ -361,8 +514,10 @@ export function generateCandidates(clips, analysis, transcripts, opts = {}) {
   // actually bounds. They are ranked by a CHEAP proxy — position and mean audio
   // level, no per-word work — because the full score is the expensive pass this
   // cap exists to keep affordable.
-  const sentenceBased = unique.filter((c) => c.sentenceIndices)
-  const windowed = unique.filter((c) => !c.sentenceIndices)
+  // Continuous short-clip candidates ride along with the sentence group: there
+  // is at most one per clip, and it is the whole point of a short clip.
+  const sentenceBased = unique.filter((c) => c.sentenceIndices || c.continuous)
+  const windowed = unique.filter((c) => !c.sentenceIndices && !c.continuous)
   const rank = (list) =>
     list
       .map((c) => ({ c, p: prescore(c, context.get(c.clipId)) }))
@@ -607,28 +762,52 @@ export function scoreAll(candidates, clips, analysis, transcripts, context) {
  * @returns {{selected:Array, totalDuration:number, relaxed:string[], maxPerClip:number, minGap:number}}
  */
 export function selectCandidates(scored, targetDuration, opts = {}) {
-  const maxPerClipBase =
-    opts.maxPerClip ?? Math.max(1, Math.ceil(targetDuration / SELECTION.secondsPerClipSlot))
-  const minGapBase = opts.minGapWithinClip ?? SELECTION.minGapWithinClip
+  const durationOf = (cand) => (Number.isFinite(cand.clipDuration) ? cand.clipDuration : Infinity)
+
+  // Per-clip now, not one number for the whole project: the constraints that
+  // keep an hour of footage diverse are the ones that reduce a 15-second clip
+  // to a single fragment.
+  const slotsFor = (cand) => {
+    if (opts.maxPerClip != null) return opts.maxPerClip
+    if (cand.preferContinuous) return 1
+    return maxPerClipFor(durationOf(cand), targetDuration)
+  }
+  const gapFor = (cand) => opts.minGapWithinClip ?? minGapFor(durationOf(cand))
+
+  // Reported constraints — the flat numbers the panel used to show, resolved
+  // against the longest clip in play so they still mean something.
+  const maxPerClipBase = Math.max(1, ...scored.map(slotsFor).filter(Number.isFinite), 1)
+  const minGapBase = scored.length ? Math.max(...scored.map(gapFor)) : SELECTION.minGapWithinClip
 
   // Relative, not absolute: a clip shot in a dim room scores lower across the
   // board, and an absolute floor would reject all of it.
   const best = scored.reduce((m, c) => Math.max(m, c.score || 0), 0)
   const floor = best * (opts.minScoreRatio ?? SELECTION.minScoreRatio)
 
-  const attempt = (maxPerClip, minGap) => {
+  // A short clip's continuous take goes first, whatever the pacing bias did to
+  // the order and regardless of the quality floor: the alternative to it is not
+  // a better segment, it is the same clip chopped into fragments.
+  const ordered = [
+    ...scored.filter((c) => c.continuous && c.preferContinuous),
+    ...scored.filter((c) => !(c.continuous && c.preferContinuous)),
+  ]
+
+  const attempt = (relaxGap, unlimited) => {
     const taken = []
     const perClip = new Map()
     let total = 0
-    for (const cand of scored) {
+    for (const cand of ordered) {
       if (total >= targetDuration) break
-      if ((cand.score || 0) < floor) continue
+      const exempt = cand.continuous && cand.preferContinuous
+      if (!exempt && (cand.score || 0) < floor) continue
       const len = cand.end - cand.start
-      if (len < LIMITS.minSeconds) continue
+      if (len < minSegmentSecondsFor(durationOf(cand))) continue
       if (taken.some((t) => overlaps(t, cand))) continue
 
       const mine = perClip.get(cand.clipId) || []
+      const maxPerClip = unlimited && !cand.preferContinuous ? Infinity : slotsFor(cand)
       if (mine.length >= maxPerClip) continue
+      const minGap = relaxGap ? Math.min(gapFor(cand), SELECTION.relaxedGap) : gapFor(cand)
       if (minGap > 0 && mine.some((t) => cand.start < t.end + minGap && cand.end + minGap > t.start)) {
         continue
       }
@@ -642,19 +821,15 @@ export function selectCandidates(scored, targetDuration, opts = {}) {
   }
 
   const relaxed = []
-  let maxPerClip = maxPerClipBase
-  let minGap = minGapBase
-  let { taken, total } = attempt(maxPerClip, minGap)
+  let { taken, total } = attempt(false, false)
 
   if (total < targetDuration * SELECTION.fillRatio) {
-    minGap = SELECTION.relaxedGap
     relaxed.push('minGapWithinClip')
-    ;({ taken, total } = attempt(maxPerClip, minGap))
+    ;({ taken, total } = attempt(true, false))
   }
   if (total < targetDuration * SELECTION.fillRatio) {
-    maxPerClip = Infinity
     relaxed.push('maxPerClip')
-    ;({ taken, total } = attempt(maxPerClip, minGap))
+    ;({ taken, total } = attempt(true, true))
   }
 
   // When the gap constraint had to be relaxed to fill the target, the pieces it
