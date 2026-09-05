@@ -132,6 +132,35 @@ function targetSamplesFor(seg) {
   return Math.round((videoFramesFor(seg) / FPS) * RATE)
 }
 
+/**
+ * Sum the finished music bed into the finished dialogue master.
+ *
+ * Deliberately the LAST thing that happens to the audio: the bed is already
+ * ducked and already exactly as long as the output, so mixing it here cannot
+ * touch the per-segment sample math that A/V sync depends on. Length mismatches
+ * are resolved by mixing the overlap and leaving the rest alone — never by
+ * resampling or padding the dialogue track.
+ */
+function mixMusicBed(track, bed) {
+  if (!track || !bed) return track
+  if (bed.sampleRate !== track.sampleRate) {
+    console.warn(
+      `[renderer] music bed is ${bed.sampleRate}Hz but the track is ${track.sampleRate}Hz — skipping the mix`,
+    )
+    return track
+  }
+  const bl = bed.getChannelData(0)
+  const br = bed.numberOfChannels > 1 ? bed.getChannelData(1) : bl
+  const n = Math.min(track.totalFrames, bed.length)
+  for (let i = 0; i < n; i++) {
+    let l = track.L[i] + bl[i]
+    let r = track.R[i] + br[i]
+    track.L[i] = l > 1 ? 1 : l < -1 ? -1 : l
+    track.R[i] = r > 1 ? 1 : r < -1 ? -1 : r
+  }
+  return track
+}
+
 async function buildAudioTrack(clips, plan, totalSec, transitionSec, onProgress, onDiag) {
   const AC = window.AudioContext || window.webkitAudioContext
   if (!AC) return null
@@ -698,7 +727,10 @@ export async function renderWithWebCodecs(clips, plan, opts = {}, onProgress = (
 
     // --- audio ------------------------------------------------------
     onProgress({ stage: 'audio', pct: 0, msg: 'Building audio track…' })
-    const audioTrack = await buildAudioTrack(clips, plan, timelineSec, transitionSec, onProgress, onDiag)
+    const audioTrack = mixMusicBed(
+      await buildAudioTrack(clips, plan, timelineSec, transitionSec, onProgress, onDiag),
+      opts.musicBed || null,
+    )
     await encodeAudio(audioTrack, muxer, onProgress)
 
     // Timeline attribution: expected total = Σ segment durations − Σ transition

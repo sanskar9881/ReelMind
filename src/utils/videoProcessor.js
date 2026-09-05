@@ -5,6 +5,7 @@ import { fetchFile, toBlobURL } from '@ffmpeg/util'
 import { checkWebCodecsSupport } from './webcodecs/support.js'
 import { renderWithWebCodecs } from './webcodecs/renderer.js'
 import { remapToOutputTimeline, toSRT } from './captions.js'
+import { prepareMusicBed, audioBufferToWav } from './music.js'
 
 // The ESM core, not the UMD one: @ffmpeg/ffmpeg 0.12 always spawns a
 // `type: "module"` worker, where `importScripts` doesn't exist, so its loader
@@ -405,13 +406,47 @@ export async function renderVideo(clips, plan, opts = {}, onProgress = () => {})
       ])
     }
 
-    const data = await ffmpeg.readFile('output.mp4')
+    // ---- PASS 3 (music) ---------------------------------------------------
+    // The bed arrives already ducked and already the right length — the same
+    // AudioBuffer the WebCodecs path mixes, so the two engines cannot disagree
+    // about the soundtrack. Video is copied, not re-encoded.
+    let musicMixed = false
+    let musicSkippedReason = null
+    if (opts.musicWav?.length) {
+      onProgress({ stage: 'music', pct: 0, msg: 'Mixing music…' })
+      try {
+        await ffmpeg.writeFile('music.wav', opts.musicWav)
+        const code = await ffmpeg.exec([
+          '-i', 'output.mp4',
+          '-i', 'music.wav',
+          '-filter_complex', '[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]',
+          '-map', '0:v', '-map', '[a]',
+          '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+          'music_out.mp4',
+        ])
+        if (code === 0) {
+          musicMixed = true
+        } else {
+          musicSkippedReason = `FFmpeg returned ${code} while mixing the music bed.`
+        }
+      } catch (err) {
+        musicSkippedReason = `Could not mix the music bed (${err?.message || err}).`
+      }
+      // Music is a garnish. A failed mix delivers the silent-of-music edit
+      // rather than failing a render the user already waited minutes for.
+      if (!musicMixed) console.warn(`[renderVideo] ${musicSkippedReason}`)
+    }
+
+    const outName = musicMixed ? 'music_out.mp4' : 'output.mp4'
+    const data = await ffmpeg.readFile(outName)
     const blob = new Blob([data.buffer], { type: 'video/mp4' })
     onProgress({ stage: 'done', pct: 100, msg: 'Render complete.' })
     return {
       url: URL.createObjectURL(blob),
       size: blob.size,
       captionsBurned,
+      musicMixed,
+      ...(musicSkippedReason ? { musicSkippedReason } : {}),
       ...(captionsSkippedReason ? { captionsSkippedReason } : {}),
     }
   } finally {
@@ -428,6 +463,8 @@ export async function renderVideo(clips, plan, opts = {}, onProgress = () => {})
     for (const p of partFiles) await kill(p)
     await kill('list.txt')
     await kill('captions.srt')
+    await kill('music.wav')
+    await kill('music_out.mp4')
     await kill('output.mp4')
   }
 }
@@ -571,14 +608,49 @@ export async function render(clips, plan, opts = {}, onProgress = () => {}) {
         })
       : null
 
+  // The music bed is built PER ENGINE because the two engines produce different
+  // output lengths from the same plan (crossfades shorten the WebCodecs
+  // timeline). A bed cut for the wrong one runs past the end or stops early.
+  const bedFor = async (engine) => {
+    if (!opts.music?.track) return null
+    try {
+      return await prepareMusicBed(splitPlan, {
+        track: opts.music.track,
+        analysis: opts.music.analysis,
+        transcripts: opts.music.transcripts,
+        totalSeconds: statsFor(engine).totalDuration,
+        transitionDuration: joinFor[engine].transitionDuration,
+        gain: opts.music.gain,
+        ducking: opts.music.ducking,
+        startAt: opts.music.startAt,
+      })
+    } catch (err) {
+      console.warn('[render] music bed failed; rendering without it:', err)
+      return null
+    }
+  }
+  const musicStats = (bed) =>
+    bed
+      ? {
+          music: {
+            mixed: true,
+            ducked: bed.curve?.duckedSeconds ?? 0,
+            duckSource: bed.curve?.source ?? 'off',
+            seconds: +(bed.buffer.length / bed.buffer.sampleRate).toFixed(2),
+          },
+        }
+      : {}
+
   const runWebCodecs = async () => {
     onProgress({ stage: 'webcodecs', pct: 0, msg: 'Starting GPU render…' })
     const cues = capFor('webcodecs')
-    const wcOpts = cues ? { ...opts, captions: { cues, style: capStyle } } : opts
+    const bed = await bedFor('webcodecs')
+    const wcOpts = { ...opts, ...(cues ? { captions: { cues, style: capStyle } } : null), musicBed: bed?.buffer || null }
     const out = await renderWithWebCodecs(clips, splitPlan, wcOpts, onProgress)
     return {
       ...out,
       ...statsFor('webcodecs'),
+      ...musicStats(bed),
       method: 'webcodecs',
       fellBack: false,
       // The canvas compositor draws captions itself — always delivered.
@@ -587,11 +659,17 @@ export async function render(clips, plan, opts = {}, onProgress = () => {}) {
   }
   const runFFmpeg = async (extra) => {
     const cues = capFor('ffmpeg')
-    const fOpts = cues ? { ...opts, captions: { srt: toSRT(cues), style: capStyle } } : opts
+    const bed = await bedFor('ffmpeg')
+    const fOpts = {
+      ...opts,
+      ...(cues ? { captions: { srt: toSRT(cues), style: capStyle } } : null),
+      musicWav: bed ? audioBufferToWav(bed.buffer) : null,
+    }
     const out = await renderVideo(clips, plan, fOpts, onProgress)
     return {
       ...out,
       ...statsFor('ffmpeg'),
+      ...musicStats(bed),
       method: 'ffmpeg',
       fellBack: false,
       captionsBurned: cues ? !!out.captionsBurned : false,

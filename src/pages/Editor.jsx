@@ -17,6 +17,14 @@ import { verifyRender, measureSync } from '../utils/verify.js'
 import { buildCaptions, remapToOutputTimeline, toSRT, toVTT } from '../utils/captions.js'
 import { analyzeEditedVideo, buildProfile, describeProfile } from '../utils/styleProfile.js'
 import {
+  loadTrack,
+  detectBeats,
+  snapCutsToBeats,
+  buildDuckingCurve,
+  MUSIC,
+  MUSIC_SOURCES,
+} from '../utils/music.js'
+import {
   createAutosave,
   loadProject,
   matchFiles,
@@ -113,6 +121,16 @@ export default function Editor() {
   const [captionSize, setCaptionSize] = useState('M') // S | M | L
   const [captionPos, setCaptionPos] = useState('bottom') // bottom | top
   const [captionBg, setCaptionBg] = useState(false)
+
+  // Music. The decoded AudioBuffer is deliberately NOT in the autosaved project
+  // — a track is megabytes of PCM, and IndexedDB is for the edit, not the audio.
+  const [musicTrack, setMusicTrack] = useState(null) // { buffer, duration, name }
+  const [musicBeats, setMusicBeats] = useState(null) // { beats, bpm, confidence }
+  const [musicBusy, setMusicBusy] = useState('')
+  const [musicGain, setMusicGain] = useState(MUSIC.defaultGain)
+  const [musicDucking, setMusicDucking] = useState(true)
+  const [snapReport, setSnapReport] = useState(null)
+  const [preSnapPlan, setPreSnapPlan] = useState(null)
 
   const [prompt, setPrompt] = useState('')
   const [aiState, setAiState] = useState('idle') // idle | thinking | done | error
@@ -868,6 +886,79 @@ export default function Editor() {
     }
   }, [])
 
+  // ---- music -------------------------------------------------------------
+
+  const onMusicFile = useCallback(
+    async (file) => {
+      if (!file) return
+      setMusicBusy('Decoding…')
+      setMusicBeats(null)
+      setSnapReport(null)
+      try {
+        const track = await loadTrack(file)
+        setMusicTrack(track)
+        setMusicBusy('Finding the beat…')
+        // Synchronous DSP on a ~3 minute track measures well under a second,
+        // but yield a frame first so the "Finding the beat" label actually paints.
+        await new Promise((r) => setTimeout(r, 0))
+        const beats = detectBeats(track.buffer)
+        setMusicBeats(beats)
+        if (beats.confidence < MUSIC.lowConfidence) {
+          toast.info(
+            'Beat detection is unsure',
+            `${track.name} has no clear pulse (confidence ${Math.round(beats.confidence * 100)}%). Snapping is off.`,
+          )
+        } else {
+          toast.success('Track loaded', `${Math.round(beats.bpm)} BPM · ${beats.beats.length} beats`)
+        }
+      } catch (err) {
+        setMusicTrack(null)
+        toast.error('Could not load track', err.message)
+      } finally {
+        setMusicBusy('')
+      }
+    },
+    [toast],
+  )
+
+  const beatsUsable = !!musicBeats && musicBeats.confidence >= MUSIC.lowConfidence && musicBeats.beats.length > 1
+
+  const doSnapToBeats = useCallback(() => {
+    if (!plan || !beatsUsable) return
+    const before = plan
+    const r = snapCutsToBeats(plan, musicBeats.beats, {
+      transcripts,
+      clips,
+      transitionDuration: 0.5,
+    })
+    setPreSnapPlan(before)
+    setPlan(r.plan)
+    setSnapReport(r)
+    toast.success(
+      'Cuts snapped to the beat',
+      `${r.moved} of ${r.considered} boundaries moved (mean ${r.meanShiftMs}ms).`,
+    )
+  }, [plan, beatsUsable, musicBeats, transcripts, clips, toast])
+
+  const undoSnap = useCallback(() => {
+    if (!preSnapPlan) return
+    setPlan(preSnapPlan)
+    setPreSnapPlan(null)
+    setSnapReport(null)
+  }, [preSnapPlan])
+
+  // What the duck will actually do, for the panel — same call the render makes.
+  const duckPreview = useMemo(() => {
+    if (!plan || !musicTrack || !musicDucking) return null
+    try {
+      return buildDuckingCurve(applyCutRanges(applyTextEdits({ ...plan, segments: plan.segments })), analysis, transcripts, {
+        transitionDuration: 0.5,
+      })
+    } catch {
+      return null
+    }
+  }, [plan, musicTrack, musicDucking, analysis, transcripts, applyTextEdits])
+
   const runRender = useCallback(async () => {
     if (rendering || !clips.length) return
     setRendering(true)
@@ -903,6 +994,15 @@ export default function Editor() {
             burnCaptions && hasCaptions && !burnInUnavailable
               ? { cuesByClip: captionCuesByClip, style: captionStyle }
               : undefined,
+          music: musicTrack
+            ? {
+                track: musicTrack.buffer,
+                gain: musicGain,
+                ducking: musicDucking,
+                analysis,
+                transcripts,
+              }
+            : undefined,
         },
         (p) => setProgress(p),
       )
@@ -938,6 +1038,11 @@ export default function Editor() {
     burnInUnavailable,
     captionCuesByClip,
     captionStyle,
+    musicTrack,
+    musicGain,
+    musicDucking,
+    analysis,
+    transcripts,
   ])
 
   // Download captions matching the finished render (or the selected clip's raw
