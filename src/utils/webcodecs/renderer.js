@@ -408,6 +408,12 @@ export async function renderWithWebCodecs(clips, plan, opts = {}, onProgress = (
   const timelineSec = Math.max(cursor, 0.1)
 
   const frames = createFrameTracker()
+  // The per-segment decoder and its queue, hoisted so the outer `finally` can
+  // reach them. A throw between creating the decoder and closing it used to
+  // leak both the decoder and every VideoFrame still queued behind it — into
+  // the NEXT render attempt, which is why a failed render made the retry worse.
+  let liveDecoder = null
+  let liveQueue = null
 
   const target = new ArrayBufferTarget()
   const muxer = new Muxer({
@@ -484,6 +490,7 @@ export async function renderWithWebCodecs(clips, plan, opts = {}, onProgress = (
       // --- decoder ------------------------------------------------------
       const decodedQueue = []
       let decoderError = null
+      liveQueue = decodedQueue
       const decoder = new VideoDecoder({
         output: (frame) => {
           frames.track(frame)
@@ -493,6 +500,7 @@ export async function renderWithWebCodecs(clips, plan, opts = {}, onProgress = (
           decoderError = e
         },
       })
+      liveDecoder = decoder
       decoder.configure({
         codec: videoTrack.codec,
         codedWidth: videoTrack.width || W,
@@ -653,6 +661,8 @@ export async function renderWithWebCodecs(clips, plan, opts = {}, onProgress = (
       await decoder.flush()
       while (decodedQueue.length) await consume(decodedQueue.shift())
       decoder.close()
+      liveDecoder = null
+      liveQueue = null
       if (decoderError) {
         dropQueue()
         throw decoderError
@@ -766,6 +776,9 @@ export async function renderWithWebCodecs(clips, plan, opts = {}, onProgress = (
     onProgress({ stage: 'done', pct: 100, msg: 'GPU render complete.' })
     return { url: URL.createObjectURL(blob), size: blob.size, method: 'webcodecs' }
   } finally {
+    // Cleanup runs on EVERY exit, success or throw. GPU frames are not garbage
+    // that the collector will get to eventually — they are a finite pool, and a
+    // failed render that leaks them makes the user's next attempt fail too.
     for (const b of tail) {
       try {
         b.close()
@@ -773,10 +786,31 @@ export async function renderWithWebCodecs(clips, plan, opts = {}, onProgress = (
         /* already closed */
       }
     }
+    if (liveQueue) {
+      for (const f of liveQueue.splice(0)) {
+        frames.release(f)
+        try {
+          f.close()
+        } catch {
+          /* already closed */
+        }
+      }
+    }
+    if (liveDecoder) {
+      try {
+        if (liveDecoder.state !== 'closed') liveDecoder.close()
+      } catch {
+        /* ignore */
+      }
+    }
     try {
       if (encoder.state !== 'closed') encoder.close()
     } catch {
       /* ignore */
+    }
+    const leaked = frames.openCount()
+    if (leaked > 0) {
+      console.warn(`[renderer] ${leaked} VideoFrame(s) still open at teardown — they are dropped here, but this is a leak worth chasing.`)
     }
   }
 }

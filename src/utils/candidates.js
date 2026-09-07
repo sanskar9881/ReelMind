@@ -220,7 +220,14 @@ const STOPWORDS = new Set(
     'i me my we our you your he she they them his her their of in on at to for with from ' +
     'by as is am are was were be been being do does did doing have has had having will ' +
     'would can could should may might must just really very much some any all no not ' +
-    'about into over under out up down off again more most other into')
+    'about into over under out up down off again more most other into ' +
+    // Hindi and Marathi function words. Without these, informationDensity reads
+    // a sentence of pure connective tissue as maximally dense in Devanagari,
+    // because none of its words match an English stopword list.
+    'है हैं था थे थी हो होता होती होते और या पर तो ही भी का के की को से में पे पर ' +
+    'यह वह ये वो जो कि क्या नहीं ना मैं मुझे मेरा हम हमारा आप आपका तुम तेरा उनका इसका ' +
+    'आहे आहेत होता होते नाही आणि किंवा पण तर च मी माझा तू तुझा आम्ही तुम्ही ते ती हे ' +
+    'या ला ने चा ची चे मध्ये वर साठी काय कोण कसं असं')
     .split(' '),
 )
 
@@ -600,7 +607,10 @@ function contentSignals(cand, transcript, cx) {
   else if (startsLower) sentenceCompleteness = 0.55
   // A group that ends without terminal punctuation is also a dangling thought.
   const lastText = group[group.length - 1]?.text || ''
-  if (!/[.!?]["')\]]?$/.test(lastText.trim())) sentenceCompleteness *= 0.75
+  // Devanagari closes a sentence with । (danda) or ॥, not a full stop — without
+  // these every Hindi and Marathi candidate reads as an unfinished thought and
+  // takes the incompleteness penalty for punctuation it was never going to use.
+  if (!/[.!?।॥]["')\]]?$/.test(lastText.trim())) sentenceCompleteness *= 0.75
 
   // 4. hook language.
   const text = cand.text || ''

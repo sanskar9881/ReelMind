@@ -22,7 +22,10 @@ const FILLER_BIGRAMS = [
 export function normalize(text) {
   const raw = String(text || '')
     .toLowerCase()
-    .replace(/[^a-z0-9'\s]/g, ' ')
+    // Keep the Devanagari block: stripping it left Hindi and Marathi sentences
+    // as empty token lists, so every pair scored 0 overlap and retake detection
+    // quietly did nothing for those languages.
+    .replace(/[^a-z0-9'\s\u0900-\u097F]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .split(' ')
@@ -92,7 +95,7 @@ function deriveFillers(sentences) {
   const out = []
   for (const s of sentences) {
     for (const w of s.words || []) {
-      const bare = String(w.text).toLowerCase().replace(/[^a-z']/g, '')
+      const bare = String(w.text).toLowerCase().replace(/[^a-z'\u0900-\u097F]/g, '')
       if (FILLER_SINGLE.has(bare)) out.push({ text: w.text, start: w.start, end: w.end })
     }
   }
@@ -209,7 +212,9 @@ export function pickBestTake(takes, transcript = {}) {
     }
     const ws = wordsOf(t)
     if (ws) {
-      return ws.filter((w) => FILLER_SINGLE.has(String(w.text).toLowerCase().replace(/[^a-z']/g, ''))).length
+      return ws.filter((w) =>
+        FILLER_SINGLE.has(String(w.text).toLowerCase().replace(/[^a-z'\u0900-\u097F]/g, '')),
+      ).length
     }
     return (t.text.toLowerCase().match(/\b(um|uh|er|ah|like|basically|literally|actually|right|so)\b/g) || []).length
   }

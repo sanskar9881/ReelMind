@@ -34,7 +34,9 @@ function wrapLines(words, maxChars, maxLines) {
   return lines
 }
 
-const isTerminal = (t) => /[.!?…]["')\]]?$/.test(String(t || ''))
+// [.!?…] plus the Devanagari danda । and double danda ॥ — a caption that never
+// sees a sentence end runs on until the line-length cap breaks it mid-thought.
+const isTerminal = (t) => /[.!?…।॥]["')\]]?$/.test(String(t || ''))
 
 /**
  * @param {{words?:{text,start,end}[], sentences?:object[]}} transcript

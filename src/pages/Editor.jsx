@@ -2,7 +2,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { probeAll, fmtTime, fmtSize } from '../utils/videoMeta.js'
 import { analyzeAll, withTranscript } from '../utils/analyzer.js'
-import { transcribeClip } from '../utils/transcribe.js'
+import {
+  transcribeClip,
+  LANGUAGES,
+  MODEL_TIERS,
+  DEFAULT_LANGUAGE,
+  DEFAULT_TIER,
+  recommendTier,
+  getLanguage,
+} from '../utils/transcribe.js'
 import { extendTakeRange } from '../utils/retakes.js'
 import {
   generateEditPlan,
@@ -14,6 +22,7 @@ import {
 import { render, estimateRenderSeconds, applyCutRanges } from '../utils/videoProcessor.js'
 import { checkWebCodecsSupport } from '../utils/webcodecs/support.js'
 import { verifyRender, measureSync } from '../utils/verify.js'
+import { buildRenderReport, summarizeReport } from '../utils/renderReport.js'
 import { buildCaptions, remapToOutputTimeline, toSRT, toVTT } from '../utils/captions.js'
 import { analyzeEditedVideo, buildProfile, describeProfile } from '../utils/styleProfile.js'
 import {
@@ -122,6 +131,14 @@ export default function Editor() {
   const [captionPos, setCaptionPos] = useState('bottom') // bottom | top
   const [captionBg, setCaptionBg] = useState(false)
 
+  // Everything that degraded during the last render — see renderReport.js.
+  const [renderReport, setRenderReport] = useState(null)
+
+  // Transcription language + model tier, both persisted with the project: a
+  // Marathi creator should not re-pick Marathi every session.
+  const [language, setLanguage] = useState(DEFAULT_LANGUAGE)
+  const [modelTier, setModelTier] = useState(DEFAULT_TIER)
+
   // Music. The decoded AudioBuffer is deliberately NOT in the autosaved project
   // — a track is megabytes of PCM, and IndexedDB is for the edit, not the audio.
   const [musicTrack, setMusicTrack] = useState(null) // { buffer, duration, name }
@@ -196,6 +213,17 @@ export default function Editor() {
   )
 
   const hasCaptions = Object.keys(captionCuesByClip).length > 0
+
+  // Clips whose analysis pass failed. analyzeAll keeps going and stores the
+  // error on the clip's entry, so these are collected but were never shown
+  // anywhere — the render report is where they surface.
+  const analysisErrors = useMemo(() => {
+    const out = []
+    for (const [id, a] of analysis) {
+      if (a?.error) out.push({ id, name: a.name || id, message: a.error })
+    }
+    return out
+  }, [analysis])
 
   const activeProfile = useMemo(
     () => profiles.find((p) => p.id === activeProfileId) || null,
@@ -494,6 +522,8 @@ export default function Editor() {
         if (s.captionPos) setCaptionPos(s.captionPos)
         if (typeof s.captionBg === 'boolean') setCaptionBg(s.captionBg)
         if (typeof s.applyStyle === 'boolean') setApplyStyle(s.applyStyle)
+        if (s.language && LANGUAGES.some((l) => l.code === s.language)) setLanguage(s.language)
+        if (s.modelTier && MODEL_TIERS.some((t) => t.id === s.modelTier)) setModelTier(s.modelTier)
 
         // Chrome/Edge can hand the files straight back via stored handles.
         const viaHandles = await restoreViaHandles(loaded.clipRefs)
@@ -728,11 +758,22 @@ export default function Editor() {
       if (transcribing) return
       setTranscribing({ clipId: clip.id, pct: 0, msg: 'Starting…' })
       try {
-        const res = await transcribeClip(clip, (p) =>
-          setTranscribing({ clipId: clip.id, pct: p.pct, msg: p.msg }),
+        const res = await transcribeClip(
+          clip,
+          (p) => setTranscribing({ clipId: clip.id, pct: p.pct, msg: p.msg }),
+          { language, tier: modelTier },
         )
         mergeTranscript(clip, res)
-        toast.success(`Transcribed ${clip.name}`, `${res.sentences.length} sentences`)
+        if (res.scriptMismatch) {
+          // Never silent: the transcript is kept (it may still be usable) but
+          // the user is told the script does not match what they asked for.
+          toast.error(
+            `${clip.name}: wrong script returned`,
+            `You selected ${getLanguage(language).label}, but the transcript came back in ${res.scriptMismatch.got === 'latin' ? 'Latin' : res.scriptMismatch.got} script. Try the Accurate model, or check the language setting.`,
+          )
+        } else {
+          toast.success(`Transcribed ${clip.name}`, `${res.sentences.length} sentences`)
+        }
       } catch (err) {
         setTranscripts((prev) => ({
           ...prev,
@@ -743,7 +784,7 @@ export default function Editor() {
         setTranscribing(null)
       }
     },
-    [transcribing, mergeTranscript, toast],
+    [transcribing, mergeTranscript, toast, language, modelTier],
   )
 
   const transcribeAllClips = useCallback(async () => {
@@ -755,8 +796,11 @@ export default function Editor() {
       setTranscribing({ clipId: clip.id, pct: 0, msg: `Starting ${i + 1}/${pending.length}…` })
       try {
         // eslint-disable-next-line no-await-in-loop -- sequential on purpose (memory)
-        const res = await transcribeClip(clip, (p) =>
-          setTranscribing({ clipId: clip.id, pct: p.pct, msg: `${p.msg} · ${i + 1}/${pending.length}` }),
+        const res = await transcribeClip(
+          clip,
+          (p) =>
+            setTranscribing({ clipId: clip.id, pct: p.pct, msg: `${p.msg} · ${i + 1}/${pending.length}` }),
+          { language, tier: modelTier },
         )
         mergeTranscript(clip, res)
       } catch (err) {
@@ -768,7 +812,7 @@ export default function Editor() {
     }
     setTranscribing(null)
     toast.success(`Transcribed ${pending.length} clip${pending.length === 1 ? '' : 's'}`)
-  }, [transcribing, clips, transcripts, mergeTranscript, toast])
+  }, [transcribing, clips, transcripts, mergeTranscript, toast, language, modelTier])
 
   const toggleStruck = useCallback(
     (clipId, idx) => {
@@ -965,6 +1009,7 @@ export default function Editor() {
     setRenderError('')
     setResult(null)
     setVerifyState(null)
+    setRenderReport(null)
     setRenderStartedAt(Date.now())
     setProgress({ stage: 'engine', pct: 0, msg: 'Preparing…' })
     try {
@@ -1011,16 +1056,54 @@ export default function Editor() {
 
       // Every render is verified — no "looks done" without a check.
       setVerifyState({ running: true, report: null, sync: null })
+      let verify = null
       try {
         const [report, sync] = await Promise.all([verifyRender(out.url, out), measureSync(out.url)])
+        verify = { report, sync }
         setVerifyState({ running: false, report, sync })
         if (diagnostics) console.log('[verify]', report, sync)
       } catch (e) {
-        setVerifyState({ running: false, report: { ok: false, checks: [{ name: 'verify', passed: false, detail: e.message }], warnings: [] }, sync: null })
+        verify = { report: { ok: false, checks: [{ name: 'verify', passed: false, detail: e.message }], warnings: [] }, sync: null }
+        setVerifyState({ running: false, ...verify })
+      }
+
+      // Everything that silently degraded, collected in one place. A user must
+      // never have to wonder why the output differs from what they asked for.
+      const report = buildRenderReport({
+        out,
+        requestedCaptions: burnCaptions && hasCaptions && !burnInUnavailable,
+        plan: effectivePlan.candidateStats ? effectivePlan : plan,
+        clips,
+        transcripts,
+        probeErrors,
+        analysisErrors,
+        profile: activeProfile,
+        profileApplied: applyStyle && !!activeProfile,
+        verify,
+        music: { requested: !!musicTrack },
+      })
+      setRenderReport(report)
+      if (report.counts.error) {
+        toast.error('Render finished with problems', summarizeReport(report))
+      } else if (report.counts.warn) {
+        toast.info('Render finished with changes', summarizeReport(report))
       }
     } catch (err) {
-      setRenderError(err.message || 'Render failed.')
-      toast.error('Render failed', err.message)
+      const msg = err?.message || 'Render failed.'
+      // Out of memory is the one render failure with an actionable answer, and
+      // the plan must survive it — the user may have spent 20 minutes on it.
+      const oom = /out of memory|allocation failed|Array buffer allocation|OOM|RangeError/i.test(
+        `${msg} ${err?.name || ''}`,
+      )
+      if (oom) {
+        setRenderError(
+          `${msg} — the browser ran out of memory. Try 720p instead of 1080p, or render fewer clips at a time. Your plan is intact.`,
+        )
+        toast.error('Out of memory', 'Try 720p, or fewer clips in one render. The plan is preserved.')
+      } else {
+        setRenderError(msg)
+        toast.error('Render failed', msg)
+      }
     } finally {
       setRendering(false)
     }
@@ -1043,6 +1126,10 @@ export default function Editor() {
     musicDucking,
     analysis,
     transcripts,
+    probeErrors,
+    analysisErrors,
+    activeProfile,
+    applyStyle,
   ])
 
   // Download captions matching the finished render (or the selected clip's raw
@@ -1143,6 +1230,8 @@ export default function Editor() {
           captionPos,
           captionBg,
           applyStyle,
+          language,
+          modelTier,
         },
       },
       clips,
@@ -1166,6 +1255,8 @@ export default function Editor() {
     captionBg,
     applyStyle,
     resolution,
+    language,
+    modelTier,
   ])
 
   // ---- candidates view ---------------------------------------------------
@@ -1676,6 +1767,69 @@ export default function Editor() {
 
           {activeLeftTab === 'transcript' && (
             <div className="ed-side-scroll">
+              <div className="ed-lang">
+                <label className="ed-field">
+                  <span>Spoken language</span>
+                  <select
+                    value={language}
+                    onChange={(e) => setLanguage(e.target.value)}
+                    disabled={!!transcribing}
+                  >
+                    {LANGUAGES.map((l) => (
+                      <option key={l.code} value={l.code}>
+                        {l.native}
+                        {l.native !== l.label ? ` · ${l.label}` : ''}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="ed-field ed-mt">
+                  <span>Speech model</span>
+                  <select
+                    value={modelTier}
+                    onChange={(e) => setModelTier(e.target.value)}
+                    disabled={!!transcribing}
+                  >
+                    {MODEL_TIERS.map((t) => (
+                      <option key={t.id} value={t.id}>
+                        {t.label} · ~{t.sizeMB}MB
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <p className="ed-dim">{MODEL_TIERS.find((t) => t.id === modelTier)?.note}</p>
+
+                {language === 'mr' && modelTier !== recommendTier('mr') && (
+                  <p className="ed-warn">
+                    Whisper saw far less Marathi than Hindi in training, and the Fast model
+                    shows it. The Accurate model closes much of that gap — a one-time 460MB
+                    download.{' '}
+                    <button className="ed-linkbtn" onClick={() => setModelTier('accurate')}>
+                      Use Accurate
+                    </button>
+                  </p>
+                )}
+
+                {language === 'auto' && (
+                  <p className="ed-warn">
+                    Auto-detect needs roughly 10 seconds of clear speech to be reliable. On
+                    short clips it guesses, and a wrong guess produces a confident, wrong
+                    transcript. Pick the language outright when you know it.
+                  </p>
+                )}
+
+                {selTranscript?.scriptMismatch && (
+                  <p className="ed-warn">
+                    This transcript came back in{' '}
+                    {selTranscript.scriptMismatch.got === 'latin' ? 'Latin' : selTranscript.scriptMismatch.got}{' '}
+                    script, but {getLanguage(selTranscript.language).label} is written in{' '}
+                    {selTranscript.scriptMismatch.expected}. It is kept — it may still be
+                    usable — but check it before planning an edit from it.
+                  </p>
+                )}
+              </div>
+
               {!selected ? (
                 <EmptyState
                   icon="💬"
@@ -2168,16 +2322,142 @@ export default function Editor() {
           )}
 
           {activeLeftTab === 'music' && (
-            <div className="ed-side-scroll ed-placeholder">
-              <p>Music mood is chosen by the planner.</p>
-              <div className="ed-chip-row">
-                {['upbeat', 'chill', 'cinematic', 'none'].map((m) => (
-                  <span key={m} className={`ed-chip${plan?.music === m ? ' is-on' : ''}`}>
-                    {m}
-                  </span>
+            <div className="ed-side-scroll">
+              <div className="ed-side-head">
+                <h3>Soundtrack</h3>
+                {musicTrack && (
+                  <button className="ed-linkbtn" onClick={() => { setMusicTrack(null); setMusicBeats(null); setSnapReport(null) }}>
+                    Remove
+                  </button>
+                )}
+              </div>
+
+              <label className={`ed-btn ed-btn-block${musicBusy ? ' is-busy' : ''}`}>
+                {musicBusy || (musicTrack ? 'Replace track' : 'Add a music track')}
+                <input
+                  type="file"
+                  accept="audio/*"
+                  hidden
+                  disabled={!!musicBusy}
+                  onChange={(e) => {
+                    onMusicFile(e.target.files?.[0])
+                    e.target.value = ''
+                  }}
+                />
+              </label>
+
+              {musicTrack && (
+                <>
+                  <div className="ed-music-track">
+                    <div className="ed-music-name">{musicTrack.name}</div>
+                    <div className="ed-dim">
+                      {fmtDur(musicTrack.duration)}
+                      {musicBeats?.bpm ? ` · ${Math.round(musicBeats.bpm)} BPM` : ''}
+                      {musicBeats ? ` · beat confidence ${Math.round(musicBeats.confidence * 100)}%` : ''}
+                    </div>
+                  </div>
+
+                  {musicBeats && !beatsUsable && (
+                    <p className="ed-warn">
+                      No reliable pulse found in this track — ambient, rubato and fingerpicked
+                      material genuinely has none. Beat snapping is unavailable rather than
+                      guessing; ducking and levels still work.
+                    </p>
+                  )}
+
+                  <label className="ed-field">
+                    <span>
+                      Music level <b>{Math.round(musicGain * 100)}%</b>
+                    </span>
+                    <input
+                      type="range"
+                      min="0"
+                      max="1"
+                      step="0.05"
+                      value={musicGain}
+                      onChange={(e) => setMusicGain(parseFloat(e.target.value))}
+                    />
+                  </label>
+
+                  <label className="ed-toggle ed-mt">
+                    <input
+                      type="checkbox"
+                      checked={musicDucking}
+                      onChange={(e) => setMusicDucking(e.target.checked)}
+                    />
+                    <span>
+                      Duck under speech
+                      <span className="ed-dim">
+                        {' '}
+                        — drops to {Math.round(MUSIC.duckGain * 100)}% while anyone is talking
+                      </span>
+                    </span>
+                  </label>
+
+                  {musicDucking && duckPreview && (
+                    <p className="ed-dim">
+                      {duckPreview.ranges.length
+                        ? `Ducking ${duckPreview.ranges.length} speech range${duckPreview.ranges.length === 1 ? '' : 's'} · ${fmtDur(duckPreview.duckedSeconds)} of ${fmtDur(duckPreview.totalSeconds)}, from the ${duckPreview.source === 'transcript' ? 'transcript' : 'audio analysis'}`
+                        : 'No speech detected in the edit — the bed plays at full level. Transcribe a clip for a more precise duck.'}
+                    </p>
+                  )}
+
+                  {beatsUsable && (
+                    <div className="ed-music-snap">
+                      <button
+                        className="ed-btn ed-btn-block"
+                        onClick={doSnapToBeats}
+                        disabled={!plan}
+                      >
+                        Snap cuts to the beat
+                      </button>
+                      {!plan && <p className="ed-dim">Generate a plan first — there are no cuts to snap yet.</p>}
+                      {snapReport && (
+                        <div className="ed-dim">
+                          Moved {snapReport.moved} of {snapReport.considered} boundaries
+                          {snapReport.moved ? ` (mean ${snapReport.meanShiftMs}ms)` : ''}.
+                          {snapReport.skipped.tooFar
+                            ? ` ${snapReport.skipped.tooFar} left alone — nearest beat was over 250ms away.`
+                            : ''}
+                          {snapReport.skipped.sentence
+                            ? ` ${snapReport.skipped.sentence} would have cut into a word.`
+                            : ''}
+                          {snapReport.skipped.tooShort
+                            ? ` ${snapReport.skipped.tooShort} would have made a shot too short.`
+                            : ''}
+                          {preSnapPlan && (
+                            <button className="ed-linkbtn" onClick={undoSnap}>
+                              Undo snap
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </>
+              )}
+
+              <div className="ed-music-sources">
+                <h4>Where to get music</h4>
+                <p className="ed-dim">
+                  ReelMind ships no track library on purpose — bundled music is a licensing
+                  liability we would be handing you. These catalogues license their own
+                  material; check the terms on the track you pick.
+                </p>
+                {MUSIC_SOURCES.map((src) => (
+                  <a key={src.name} className="ed-music-source" href={src.url} target="_blank" rel="noreferrer noopener">
+                    <span className="ed-music-source-name">
+                      {src.name}
+                      {src.attribution === 'no' ? (
+                        <span className="ed-tag">no credit needed</span>
+                      ) : (
+                        <span className="ed-tag is-warn">credit required</span>
+                      )}
+                    </span>
+                    <span className="ed-dim">{src.note}</span>
+                  </a>
                 ))}
               </div>
-              <p className="ed-dim">Track library lands in Creator tier.</p>
             </div>
           )}
 
@@ -2547,6 +2827,34 @@ export default function Editor() {
                   {smoke.log.map((line, i) => (
                     <div key={i}>{line}</div>
                   ))}
+                </div>
+              )}
+
+              {renderReport && (
+                <div className={`ed-report${renderReport.counts.error ? ' is-bad' : renderReport.counts.warn ? ' is-warn' : ' is-ok'}`}>
+                  <div className="ed-report-head">
+                    <h4>Render report</h4>
+                    <span>{summarizeReport(renderReport)}</span>
+                  </div>
+                  {!renderReport.items.length ? (
+                    <p className="ed-dim">
+                      No degradations. Captions, engine, planner, transcripts and verification
+                      all came through as asked.
+                    </p>
+                  ) : (
+                    <ul className="ed-report-list">
+                      {renderReport.items.map((it, i) => (
+                        <li key={i} className={`ed-report-item is-${it.severity}`}>
+                          <div className="ed-report-title">
+                            <span className="ed-report-area">{it.area}</span>
+                            {it.title}
+                          </div>
+                          <div className="ed-dim">{it.detail}</div>
+                          {it.hint && <div className="ed-report-hint">{it.hint}</div>}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
                 </div>
               )}
 
@@ -3084,6 +3392,45 @@ const CSS = `
 .ed-caps-note.is-info { color: var(--muted); }
 .ed-toggle.is-disabled { opacity: .55; cursor: not-allowed; }
 .ed-toggle.is-disabled input { cursor: not-allowed; }
+/* Render report — every silent degradation, in one place */
+.ed-report { margin-top: var(--s3); border: 1px solid var(--border); border-left-width: 3px; border-radius: var(--r-sm); padding: var(--s3); background: var(--panel); }
+.ed-report.is-ok { border-left-color: #7CFFB2; }
+.ed-report.is-warn { border-left-color: #ffcf8a; }
+.ed-report.is-bad { border-left-color: var(--pink); }
+.ed-report-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--s2); margin-bottom: var(--s2); }
+.ed-report-head h4 { font-size: 11px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+.ed-report-head span { font-size: 11.5px; font-weight: 600; }
+.ed-report.is-bad .ed-report-head span { color: var(--pink); }
+.ed-report.is-warn .ed-report-head span { color: #ffcf8a; }
+.ed-report.is-ok .ed-report-head span { color: #7CFFB2; }
+.ed-report-list { list-style: none; display: flex; flex-direction: column; gap: var(--s2); }
+.ed-report-item { padding: var(--s2); border-radius: var(--r-sm); background: var(--bg); border-left: 2px solid var(--muted-line); }
+.ed-report-item.is-error { border-left-color: var(--pink); }
+.ed-report-item.is-warn { border-left-color: #ffcf8a; }
+.ed-report-title { font-size: 12px; font-weight: 600; display: flex; gap: var(--s2); align-items: baseline; flex-wrap: wrap; }
+.ed-report-area { font-size: 9.5px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+.ed-report-hint { font-size: 11px; color: var(--muted); margin-top: 3px; font-style: italic; }
+
+.ed-lang { padding-bottom: var(--s3); margin-bottom: var(--s3); border-bottom: 1px solid var(--muted-line); display: flex; flex-direction: column; gap: var(--s2); }
+
+.ed-side-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--s2); }
+.ed-side-head h3 { font-size: 12px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+
+/* Music panel */
+.ed-music-track { margin-top: var(--s3); padding: var(--s3); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); }
+.ed-music-name { font-size: 12.5px; font-weight: 600; word-break: break-word; }
+.ed-music-track .ed-dim { margin-top: 2px; }
+.ed-music-snap { margin-top: var(--s3); display: flex; flex-direction: column; gap: var(--s1); }
+.ed-music-sources { margin-top: var(--s4); border-top: 1px solid var(--muted-line); padding-top: var(--s3); }
+.ed-music-sources h4 { font-size: 11px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+.ed-music-source { display: flex; flex-direction: column; gap: 2px; min-height: var(--tap); padding: var(--s2) 0; border-bottom: 1px solid var(--muted-line); color: var(--text); text-decoration: none; font-size: 12px; }
+.ed-music-source:last-child { border-bottom: none; }
+.ed-music-source:hover .ed-music-source-name { color: var(--cyan); }
+.ed-music-source-name { display: flex; align-items: center; gap: var(--s2); font-weight: 600; }
+.ed-tag { font-size: 9.5px; font-weight: 600; letter-spacing: .03em; text-transform: uppercase; padding: 2px 6px; border-radius: 999px; background: rgba(9,246,255,.12); border: 1px solid rgba(9,246,255,.4); color: var(--cyan); }
+.ed-tag.is-warn { background: rgba(255,190,90,.1); border-color: rgba(255,190,90,.35); color: #ffcf8a; }
+.ed-btn.is-busy { opacity: .7; pointer-events: none; }
+
 .ed-warn { font-size: 11px; line-height: 1.5; color: #ffcf8a; background: rgba(255,190,90,.09); border: 1px solid rgba(255,190,90,.35); border-radius: 8px; padding: 8px 10px; }
 .ed-caps-row { display: flex; align-items: center; gap: 6px; }
 .ed-caps-row > .ed-dim { width: 58px; flex: none; }
